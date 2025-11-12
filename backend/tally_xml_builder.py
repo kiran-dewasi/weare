@@ -1,4 +1,17 @@
 from typing import Dict, Any, Optional
+from xml.sax.saxutils import escape
+import xml.etree.ElementTree as ET
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tally_import")
+
+def parse_xml_safely(xml_text):
+    try:
+        return ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        logger.error(f"XML ParseError: {e}; raw: {xml_text[:2000]}")
+        return None
 
 def build_voucher_xml(
     voucher_type: str, 
@@ -23,21 +36,21 @@ def build_voucher_xml(
     """
     xml = f"""
 <VOUCHER>
-    <DATE>{date}</DATE>
-    <VOUCHERTYPENAME>{voucher_type}</VOUCHERTYPENAME>
-    <PARTYLEDGERNAME>{party_ledger}</PARTYLEDGERNAME>
-    <NARRATION>{narration}</NARRATION>
+    <DATE>{escape(date)}</DATE>
+    <VOUCHERTYPENAME>{escape(voucher_type)}</VOUCHERTYPENAME>
+    <PARTYLEDGERNAME>{escape(party_ledger)}</PARTYLEDGERNAME>
+    <NARRATION>{escape(narration)}</NARRATION>
     <ALLLEDGERENTRIES.LIST>
-        <LEDGERNAME>{party_ledger}</LEDGERNAME>
+        <LEDGERNAME>{escape(party_ledger)}</LEDGERNAME>
         <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
         <AMOUNT>{amount:.2f}</AMOUNT>
     </ALLLEDGERENTRIES.LIST>
 """
     if voucher_number:
-        xml += f"    <VOUCHERNUMBER>{voucher_number}</VOUCHERNUMBER>\n"
+        xml += f"    <VOUCHERNUMBER>{escape(voucher_number)}</VOUCHERNUMBER>\n"
     # Add extra XML tags if provided
     if extra_fields:
         for tag, value in extra_fields.items():
-            xml += f"    <{tag}>{value}</{tag}>\n"
+            xml += f"    <{escape(str(tag))}>{escape(str(value))}</{escape(str(tag))}>\n"
     xml += "</VOUCHER>"
     return xml.strip()

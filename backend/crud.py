@@ -3,6 +3,11 @@ from typing import Any, Dict, Optional
 import pickle
 import os
 from backend.tally_connector import TallyConnector
+from xml.sax.saxutils import escape
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tally_import")
 
 class LedgerCRUD:
     """
@@ -35,7 +40,7 @@ class LedgerCRUD:
                 voucher_xml = self._entry_to_voucher_xml(self.df.loc[idx[0]])
                 self.tally_connector.push_voucher(self.company_name, voucher_xml)
             except Exception as ex:
-                print(f"Failed to push update to Tally: {ex}")
+                logger.error(f"Failed to push update to Tally: {ex}")
         # Additional: log update here for audit/history
 
     def add_entry(self, entry: Dict[str, Any]) -> None:
@@ -51,7 +56,7 @@ class LedgerCRUD:
                 voucher_xml = self._entry_to_voucher_xml(entry)
                 self.tally_connector.push_voucher(self.company_name, voucher_xml)
             except Exception as ex:
-                print(f"Failed to push add to Tally: {ex}")
+                logger.error(f"Failed to push add to Tally: {ex}")
 
     def delete_entry(self, entry_id: Any) -> None:
         """
@@ -67,7 +72,7 @@ class LedgerCRUD:
                 voucher_xml = self._entry_to_delete_voucher_xml(entry_id)
                 self.tally_connector.push_voucher(self.company_name, voucher_xml)
             except Exception as ex:
-                print(f"Failed to push delete to Tally: {ex}")
+                logger.error(f"Failed to push delete to Tally: {ex}")
 
     def get_entry(self, entry_id: Any) -> Optional[Dict[str, Any]]:
         """
@@ -105,10 +110,10 @@ class LedgerCRUD:
     def _entry_to_voucher_xml(self, entry: Any) -> str:
         """Convert a DataFrame row or dict to <VOUCHER> XML suitable for Tally. Customize per schema needed."""
         # This must be tailored to your Tally XML schema. Minimal sketch below:
-        xml = f'<VOUCHER><ID>{entry["ID"]}</ID>'
+        xml = f'<VOUCHER><ID>{escape(str(entry["ID"]))}</ID>'
         for col, val in entry.items():
             if col != "ID":
-                xml += f'<{col}>{val}</{col}>'
+                xml += f'<{escape(str(col))}>{escape(str(val))}</{escape(str(col))}>'
         xml += '</VOUCHER>'
         return xml
 
@@ -128,7 +133,7 @@ def log_change(df: pd.DataFrame, log_path: str = "data_log.pkl"):
 def undo_last_change(log_path: str = "data_log.pkl") -> pd.DataFrame:
     """Revert to previous DataFrame state from log."""
     if not os.path.exists(log_path):
-        print("No log file found for undo.")
+        logger.warning("No log file found for undo.")
         return pd.DataFrame()
     try:
         states = []
@@ -146,13 +151,13 @@ def undo_last_change(log_path: str = "data_log.pkl") -> pd.DataFrame:
                     pickle.dump(s, f)
             return states[-1]
         elif states:
-            print("Only initial state in log; cannot undo.")
+            logger.warning("Only initial state in log; cannot undo.")
             return states[0]
         else:
-            print("Log is empty.")
+            logger.warning("Log is empty.")
             return pd.DataFrame()
     except Exception as e:
-        print(f"Undo error: {e}")
+        logger.error(f"Undo error: {e}")
         return pd.DataFrame()
 
 
@@ -168,7 +173,7 @@ def add_entry(df: pd.DataFrame, entry: Dict[str, Any]) -> pd.DataFrame:
         # The dataframe is modified in-place via crud.df reference
         return crud.df
     except Exception as e:
-        print(f"Add entry error: {e}")
+        logger.error(f"Add entry error: {e}")
         # Fallback to old method - just add what's provided
         new_df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
         return new_df
@@ -191,7 +196,7 @@ def update_entry(df: pd.DataFrame, idx: int, updates: Dict[str, Any]) -> pd.Data
                     df.at[idx, key] = value
             return df
     except Exception as e:
-        print(f"Update entry error: {e}")
+        logger.error(f"Update entry error: {e}")
         # Fallback to old method
         for key, value in updates.items():
             if key in df.columns:
@@ -214,7 +219,7 @@ def delete_entry(df: pd.DataFrame, idx: int) -> pd.DataFrame:
             new_df = df.drop(idx).reset_index(drop=True)
             return new_df
     except Exception as e:
-        print(f"Delete entry error: {e}")
+        logger.error(f"Delete entry error: {e}")
         # Fallback to old method
         new_df = df.drop(idx).reset_index(drop=True)
         return new_df

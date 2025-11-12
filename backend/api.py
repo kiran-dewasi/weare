@@ -4,11 +4,13 @@ from typing import Optional, Dict, Any
 import pandas as pd
 from backend.loader import LedgerLoader
 from backend.agent import TallyAuditAgent
-from backend.tally_connector import TallyConnector
+from backend.tally_connector import TallyConnector, get_customer_details
 from backend import crud
 import io
 import os
+import logging
 from dotenv import load_dotenv
+from fastapi.encoders import jsonable_encoder
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,6 +35,66 @@ class ModifyRequest(BaseModel):
     data: Dict[str, Any]
     idx: Optional[int] = None  # For update/delete
     live_sync: Optional[bool] = False  # If True, always push change to Tally
+
+# ----------------------- New Routes (minimal additions) -----------------------
+class ImportXMLRequest(BaseModel):
+    xml_input: str
+
+@app.post("/import-tally/")
+def import_tally(req: ImportXMLRequest):
+    global dataframe
+    xml_text = req.xml_input
+    # Try parsing as ledgers first
+    df_ledgers = TallyConnector._parse_ledger_xml(xml_text)
+    if not df_ledgers.empty:
+        dataframe = df_ledgers
+        rows = jsonable_encoder(df_ledgers.to_dict(orient="records"))
+        return {"status": "ok", "type": "ledger", "rows": rows}
+    # Try parsing as vouchers
+    df_vouchers = TallyConnector._parse_voucher_xml(xml_text)
+    if not df_vouchers.empty:
+        rows = jsonable_encoder(df_vouchers.to_dict(orient="records"))
+        return {"status": "ok", "type": "voucher", "rows": rows}
+    # Unknown/empty
+    return {"status": "ok", "type": "unknown", "rows": []}
+
+class AgentQuery(BaseModel):
+    query: str
+
+@app.post("/ask-agent/")
+def ask_agent(request: AgentQuery):
+    if dataframe is None:
+        raise HTTPException(status_code=400, detail="No ledger data loaded.")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY environment variable not set")
+    agent = TallyAuditAgent(api_key=api_key)
+    result = agent.ask_audit_question(dataframe, request.query)
+    return {"result": result}
+
+class CustomerDetailsRequest(BaseModel):
+    name: str
+
+@app.post("/customer-details/")
+def customer_details(req: CustomerDetailsRequest):
+    if dataframe is None or dataframe.empty:
+        return {"status": "error", "detail": "No data loaded."}
+    details = get_customer_details(dataframe, req.name)
+    return {"status": "ok", "name": req.name, "details": jsonable_encoder(details)}
+
+@app.get("/list-ledgers/")
+def list_ledgers():
+    try:
+        if dataframe is None:
+            return {"status": "error", "detail": "No data loaded."}
+        if dataframe.empty:
+            return {"status": "ok", "rows": []}
+        rows = jsonable_encoder(dataframe.to_dict(orient="records"))
+        return {"status": "ok", "rows": rows}
+    except Exception as e:
+        logging.error(f"Error in list_ledgers: {e}")
+        return {"status": "error", "detail": str(e)}
+# --------------------- End New Routes (minimal additions) ---------------------
 
 @app.post("/audit")
 def audit_entry(request: AuditRequest):
@@ -73,6 +135,10 @@ def modify_entry(request: ModifyRequest):
                 crud_obj.update_entry(entry_id, request.data)
                 dataframe = crud_obj.df
             else:
+                if request.idx is None:
+                    raise ValueError("Must supply idx for updates in non-live mode.")
+                if request.idx < 0 or request.idx >= len(df):
+                    raise ValueError(f"Index {request.idx} is out of bounds. DataFrame has {len(df)} rows.")
                 dataframe = crud.update_entry(df, request.idx, request.data)
         elif request.action == 'delete':
             if use_live:
@@ -82,6 +148,10 @@ def modify_entry(request: ModifyRequest):
                 crud_obj.delete_entry(entry_id)
                 dataframe = crud_obj.df
             else:
+                if request.idx is None:
+                    raise ValueError("Must supply idx for delete in non-live mode.")
+                if request.idx < 0 or request.idx >= len(df):
+                    raise ValueError(f"Index {request.idx} is out of bounds. DataFrame has {len(df)} rows.")
                 dataframe = crud.delete_entry(df, request.idx)
         else:
             raise ValueError("Unknown action")
