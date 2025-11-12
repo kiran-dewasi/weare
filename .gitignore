@@ -1,0 +1,11 @@
+*.pyc
+__pycache__/
+.venv/
+.env
+*.log
+*.db
+node_modules/
+*.ipynb_checkpoints/
+*.csv
+*.xlsx
+.DS_Store
