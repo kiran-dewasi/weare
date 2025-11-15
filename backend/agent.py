@@ -3,7 +3,8 @@ import pandas as pd
 from typing import Union, Dict, Any
 import os
 from backend.tally_connector import TallyConnector, get_customer_details
-from backend.tally_xml_builder import build_voucher_xml
+from backend.tally_live_update import create_voucher_in_tally, TallyAPIError, TallyIgnoredError
+from backend.tally_xml_builder import TallyXMLValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -151,32 +152,51 @@ class TallyAgent:
         # 4. Enrich parameters
         enriched_params = {**params, **customer_details}
 
-        # 5. Build voucher XML
+        # 5. Build voucher XML using strict schema builder
         try:
-            voucher_xml = build_voucher_xml(
-                voucher_type=voucher_type,
-                date=date,
-                party_ledger=party,
-                amount=float(amount),
-                narration=narration,
-                voucher_number=voucher_number,
-                extra_fields=customer_details
-            )
-            print(f"[LOG] Built voucher XML: {voucher_xml[:120]}...")
-        except Exception as ex:
-            print(f"[ERROR] Failed to build XML: {ex}")
-            return {"error": "Failed to build voucher XML", "details": str(ex)}
+            amount_value = float(amount)
+        except (TypeError, ValueError) as ex:
+            print(f"[ERROR] Invalid amount '{amount}': {ex}")
+            return {"error": "Invalid amount supplied", "details": str(ex)}
 
-        # 6. Push voucher to Tally
+        voucher_fields = {
+            "DATE": str(date),
+            "VOUCHERTYPENAME": str(voucher_type),
+            "PARTYLEDGERNAME": str(party) if party else "",
+            "NARRATION": str(narration or ""),
+        }
+        if voucher_number:
+            voucher_fields["VOUCHERNUMBER"] = str(voucher_number)
+
+        line_items = [
+            {
+                "ledger_name": str(party) if party else "",
+                "amount": amount_value,
+                "is_deemed_positive": amount_value < 0,
+            }
+        ]
+
         try:
-            response = tc.push_voucher(company_name, voucher_xml)
-            print(f"[LOG] Push response: {response}")
+            response = create_voucher_in_tally(
+                company_name=company_name,
+                voucher_fields=voucher_fields,
+                line_items=line_items,
+                tally_url=tally_url,
+            )
+            print(f"[LOG] Push response: {response.to_dict()}")
             return {
                 "status": "pushed_to_tally",
                 "intent": intent,
                 "party": party,
                 "amount": amount,
-                "response": response
+                "response": response.to_dict(),
+            }
+        except (TallyXMLValidationError, TallyAPIError, TallyIgnoredError) as ex:
+            print(f"[ERROR] Failed to build XML: {ex}")
+            return {
+                "error": "Failed to push voucher to Tally",
+                "details": str(ex),
+                "response": getattr(ex, "response", None).to_dict() if getattr(ex, "response", None) else None,
             }
         except Exception as ex:
             print(f"[ERROR] Failed to push to Tally: {ex}")

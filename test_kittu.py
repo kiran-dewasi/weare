@@ -2,6 +2,7 @@ import requests
 import json
 import logging
 import sys
+import pytest
 
 # ----------- CONFIGURATION -----------
 API_BASE = "http://localhost:8000"  # Update if your API runs elsewhere
@@ -17,7 +18,7 @@ ENDPOINTS = {
 SAMPLE_XML = "sample_tally.xml"
 TEST_QUESTION = "Give me all overdue bills for company Acme Corp."
 MODIFY_RECORD_ID = 123
-DEFAULT_UPDATES = {"status": "paid", "amount": 5000}
+DEFAULT_UPDATES = {"NAME": "Acme Corp Updated", "PARENT": "Sundry Debtors"}
 CUSTOMER_NAME = "Acme Corp"
 
 logging.basicConfig(level=logging.INFO)
@@ -45,26 +46,30 @@ def get_index_by_id(record_id):
             return idx
     return None
 
-def test_import_tally_xml(xml_path):
-    xml_data = read_xml_file(xml_path)
+def test_import_tally_xml():
+    xml_data = read_xml_file(SAMPLE_XML)
     resp = requests.post(API_BASE + ENDPOINTS["import_xml"], json={"xml_input": xml_data})
     print("\n[Import XML] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for import"
-    return resp.json()
+    assert resp.ok, f"API did not return OK for import: {resp.text}"
+    rows = resp.json().get("rows", [])
+    assert isinstance(rows, list)
 
-def test_agent_query(question):
+def test_agent_query():
+    question = TEST_QUESTION
     resp = requests.post(API_BASE + ENDPOINTS["agent_query"], json={"query": question})
     print("\n[Agent Q&A] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for agent query"
-    return resp.json()
+    assert resp.ok, f"API did not return OK for agent query: {resp.text}"
+    assert "result" in resp.json()
 
-def test_data_modification(record_id, updates):
+def test_data_modification():
+    record_id = MODIFY_RECORD_ID
+    updates = DEFAULT_UPDATES
     idx = get_index_by_id(record_id)
     if idx is None:
         print(f"\n[Modify Data] Could not find idx for record_id={record_id}")
-        idx = 0  # fallback to first row to keep test moving
+        idx = 0
     modify_payload = {
         "action": "update",
         "data": updates,
@@ -75,14 +80,15 @@ def test_data_modification(record_id, updates):
     print(json.dumps(modify_payload, indent=2))
     print("[Modify Data] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for modification"
-    return resp.json()
+    assert resp.ok, f"API did not return OK for modification: {resp.text}"
+    assert resp.json().get("status") == "success"
 
-def test_data_deletion(record_id):
+def test_data_deletion():
+    record_id = MODIFY_RECORD_ID
     idx = get_index_by_id(record_id)
     if idx is None:
         print(f"\n[Delete Data] Could not find idx for record_id={record_id}")
-        idx = 0  # fallback to first row
+        idx = 0
     delete_payload = {
         "action": "delete",
         "data": {},
@@ -93,15 +99,15 @@ def test_data_deletion(record_id):
     print(json.dumps(delete_payload, indent=2))
     print("[Delete Data] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for deletion"
-    return resp.json()
+    assert resp.ok, f"API did not return OK for deletion: {resp.text}"
 
-def test_customer_details(customer_name):
+def test_customer_details():
+    customer_name = CUSTOMER_NAME
     resp = requests.post(API_BASE + ENDPOINTS["get_customer_details"], json={"name": customer_name})
     print("\n[Customer Details] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for customer details"
-    return resp.json()
+    assert resp.ok, f"API did not return OK for customer details: {resp.text}"
+    assert resp.json().get("details") is not None
 
 def test_customer_edge_cases():
     test_names = [" acme corp ", "ACME CORP", "acme corp", "Nonexistent Co"]
@@ -109,7 +115,7 @@ def test_customer_edge_cases():
         resp = requests.post(API_BASE + ENDPOINTS["get_customer_details"], json={"name": name})
         print(f"\n[Customer Lookup: '{name}'] Response:")
         print(json.dumps(resp.json(), indent=2))
-        assert resp.ok, "API did not return OK for customer lookup"
+        assert resp.ok, f"API did not return OK for customer lookup: {resp.text}"
 
 def test_modify_nonexistent():
     modify_payload = {
@@ -122,16 +128,16 @@ def test_modify_nonexistent():
     print(json.dumps(modify_payload, indent=2))
     print("[Modify Non-existent Record] Response:")
     print(json.dumps(resp.json(), indent=2))
-    assert resp.ok, "API did not return OK for modifying non-existent"
+    assert resp.status_code == 400
+    assert "No data loaded." in resp.json().get("detail", "")
 
 def test_broken_xml():
-    # Purposefully invalid XML string
     bad_xml = "<root><data></root"
     resp = requests.post(API_BASE + ENDPOINTS["import_xml"], json={"xml_input": bad_xml})
     print("\n[Broken XML Import] Response (should error gracefully):")
     print(json.dumps(resp.json(), indent=2))
     assert resp.ok, "API did not return OK on broken XML (should provide error feedback)"
-    return resp.json()
+    assert resp.json().get("status") == "ok"
 
 def test_list_data():
     resp = requests.get(API_BASE + ENDPOINTS["list_ledgers"])
@@ -143,68 +149,72 @@ def test_list_data():
         print("[List Ledgers] Response:")
         print(json.dumps(data, indent=2))
         assert resp.ok, "API did not return OK for listing"
-        return data
+        assert isinstance(data.get("rows"), list)
     except json.JSONDecodeError as e:
         print(f"[List Ledgers] JSON Decode Error: {e}")
         print("[List Ledgers] Raw Response Text:", resp.text[:500])
-        raise
+        assert False, "Response was not valid JSON"
 
 def test_full_agent_pipeline():
     xml_data = read_xml_file(SAMPLE_XML)
     import_resp = requests.post(API_BASE + ENDPOINTS["import_xml"], json={"xml_input": xml_data}).json()
     # Try to extract first record's id
-    first_record_id = None
     rows = None
-    if import_resp.get('data') and 'rows' in import_resp['data'] and import_resp['data']['rows']:
-        rows = import_resp['data']['rows']
-    elif import_resp.get('rows') and isinstance(import_resp['rows'], list) and import_resp['rows']:
+    if import_resp.get('rows') and isinstance(import_resp['rows'], list) and import_resp['rows']:
         rows = import_resp['rows']
-    if rows:
-        # Derive record id from common key variants
-        first = rows[0]
-        first_record_id = first.get('ID') or first.get('id')
+    first_record_id = rows[0].get('ID') if rows and rows[0] else None
     if first_record_id:
-        # Agent Q&A before modification
         q_resp = requests.post(API_BASE + ENDPOINTS["agent_query"], json={"query": TEST_QUESTION}).json()
         print("\n[Agent Q&A - Pre Modification] Response:", json.dumps(q_resp, indent=2))
-        # Modify the record via idx mapping
-        test_data_modification(first_record_id, {"status": "paid"})
-        # Agent Q&A after modification
+        idx = get_index_by_id(first_record_id)
+        if idx is None:
+            idx = 0
+        modify_payload = {"action": "update", "data": {"NAME": "Acme Corp Final"}, "idx": idx}
+        resp = requests.post(API_BASE + ENDPOINTS["modify_data"], json=modify_payload)
+        assert resp.ok, f"API did not return OK for modification: {resp.text}"
         verify_resp = requests.post(API_BASE + ENDPOINTS["agent_query"], json={"query": TEST_QUESTION}).json()
         print("\n[Agent Q&A - Post Modification] Response:", json.dumps(verify_resp, indent=2))
     else:
         print("No records available to chain-test.")
+        assert False, "No records in sample XML for full agent pipeline test"
 
 def test_api_robustness():
-    # Malformed JSON
-    bad_json = '{"xml_input": "<root></root>'  # missing closing quote/brace
+    bad_json = '{"xml_input": "<root></root>'
     resp = requests.post(API_BASE + ENDPOINTS["import_xml"], data=bad_json, headers={"Content-Type": "application/json"})
     print("\n[Malformed JSON] Response:", resp.text)
-    # Wrong content type
+    assert not resp.ok or resp.status_code in (400, 422)
     resp = requests.post(API_BASE + ENDPOINTS["import_xml"], data="<root></root>", headers={"Content-Type": "text/plain"})
     print("\n[Wrong Content-Type] Response:", resp.text)
-    # Missing required field
+    assert not resp.ok or resp.status_code in (400, 415, 422)
     resp = requests.post(API_BASE + ENDPOINTS["import_xml"], json={})
     print("\n[Missing Field] Response:", resp.text)
+    assert not resp.ok or resp.status_code == 422
 
 # ----------- RUN TEST SUITE -----------
+@pytest.fixture(scope="session", autouse=True)
+def ensure_ledger_loaded():
+    """Automatically POSTs sample XML to /import-tally/ before any tests."""
+    xml_data = read_xml_file(SAMPLE_XML)
+    resp = requests.post(API_BASE + ENDPOINTS["import_xml"], json={"xml_input": xml_data})
+    assert resp.ok, f"Could not load sample XML: {resp.text}"
+
 if __name__ == "__main__":
     print("\n======= Kittu System End-to-End Test =======")
 
     # 1. Test XML Import and Parsing
-    import_response = test_import_tally_xml(SAMPLE_XML)
+    test_import_tally_xml()
 
     # 2. Test Agent Q&A Endpoint
-    agent_response = test_agent_query(TEST_QUESTION)
+    test_agent_query()
 
     # 3. Test Data Modification Endpoint (using ID->idx mapping)
-    mod_response = test_data_modification(MODIFY_RECORD_ID, DEFAULT_UPDATES)
+    test_data_modification()
 
     # 4. Test Data Deletion (using ID->idx mapping)
-    delete_response = test_data_deletion(MODIFY_RECORD_ID)
+    test_data_deletion()
 
     # 5. Test Customer Detail Lookup
-    cust_response = test_customer_details(CUSTOMER_NAME)
+    test_customer_details()
 
     # 6. Test Customer Lookup Edge Cases
     test_customer_edge_cases()
@@ -213,10 +223,10 @@ if __name__ == "__main__":
     test_modify_nonexistent()
 
     # 8. Test List Ledgers Endpoint
-    list_response = test_list_data()
+    test_list_data()
 
     # 9. Robustness: Test Invalid/Broken XML
-    broken_response = test_broken_xml()
+    test_broken_xml()
 
     # 10. Test Full Agent Pipeline (import, agent Q, modify, agent Q)
     test_full_agent_pipeline()
