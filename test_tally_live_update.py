@@ -115,6 +115,49 @@ def test_update_ledger_in_tally_rejects_invalid_fields():
 
 
 @patch("backend.tally_live_update.requests.post")
+def test_update_ledger_in_tally_all_valid_fields_pass(mock_post):
+    # All fields are whitelisted
+    mock_post.return_value = _mock_post(SUCCESS_LEDGER_RESPONSE)
+    try:
+        update_ledger_in_tally(
+            company_name="Test Co",
+            ledger_name="MainLedger",
+            field_updates={"NAME": "NewName"}
+        )
+    except TallyXMLValidationError as exc:
+        assert False, f"No error expected, got {exc}"
+
+
+def test_update_ledger_in_tally_all_invalid_fields_error():
+    with pytest.raises(TallyXMLValidationError) as exc_info:
+        update_ledger_in_tally(
+            company_name="Test Co",
+            ledger_name="WillFail",
+            field_updates={"amount": 100, "status": "closed", "id": 99}
+        )
+    error = exc_info.value.args[0]
+    assert isinstance(error, dict)
+    assert error["status"] == "error"
+    for field in ["amount", "status", "id"]:
+        assert field in error["invalid_fields"]
+    assert "NAME" in error["allowed_fields"]
+
+
+def test_update_ledger_in_tally_mixed_fields_error():
+    with pytest.raises(TallyXMLValidationError) as exc_info:
+        update_ledger_in_tally(
+            company_name="Test Co",
+            ledger_name="WillFail",
+            field_updates={"NAME": "X", "status": "closed", "GSTIN": "Y"}
+        )
+    error = exc_info.value.args[0]
+    assert isinstance(error, dict)
+    assert error["status"] == "error"
+    assert "status" in error["invalid_fields"]
+    assert "GSTIN" in error["allowed_fields"]
+
+
+@patch("backend.tally_live_update.requests.post")
 def test_create_voucher_in_tally_success(mock_post):
     mock_post.return_value = _mock_post(SUCCESS_VOUCHER_RESPONSE)
     response = create_voucher_in_tally(

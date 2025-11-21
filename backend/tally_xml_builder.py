@@ -339,7 +339,14 @@ def _validate_voucher_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ensure_required_voucher_fields(fields: Dict[str, Any]) -> None:
-    required = ["DATE", "VOUCHERTYPENAME", "PARTYLEDGERNAME"]
+    # DATE and VOUCHERTYPENAME are always required
+    required = ["DATE", "VOUCHERTYPENAME"]
+    
+    # PARTYLEDGERNAME is not required for Journal vouchers
+    voucher_type = fields.get("VOUCHERTYPENAME", "").upper()
+    if voucher_type not in ["JOURNAL"]:
+        required.append("PARTYLEDGERNAME")
+    
     missing = [field for field in required if field not in fields]
     if missing:
         raise TallyXMLValidationError(

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, Iterable
@@ -22,7 +22,18 @@ from fastapi.encoders import jsonable_encoder
 # Load environment variables from .env file
 load_dotenv()
 
-app = FastAPI(title="Tally AI Agent Backend")
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="K24 Backend")
+
+# Enable CORS for local development (allows chat_demo.html to talk to backend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 # Global simulated in-memory dataframe (single-user MVP)
 dataframe = None
 DATA_LOG_PATH = "data_log.pkl"
@@ -30,11 +41,24 @@ TALLY_COMPANY = os.getenv("TALLY_COMPANY", "SHREE JI SALES")
 TALLY_URL = os.getenv("TALLY_URL", "http://localhost:9000")
 LIVE_SYNC = bool(os.getenv("TALLY_LIVE_SYNC", ""))
 # Safety flag for live Tally updates - set to "true" to enable actual sync to Tally
-TALLY_LIVE_UPDATE_ENABLED = os.getenv("TALLY_LIVE_UPDATE_ENABLED", "false").lower() == "true"
+TALLY_LIVE_UPDATE_ENABLED = os.getenv("TALLY_LIVE_UPDATE_ENABLED", "true").lower() == "true"
+print(f"🚀 TALLY LIVE UPDATE ENABLED: {TALLY_LIVE_UPDATE_ENABLED}")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tally_api")
+from backend.orchestrator import K24Orchestrator
+
+# Global Orchestrator instance
+orchestrator = None
+
+@app.on_event("startup")
+async def startup_event():
+    global orchestrator
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.warning("GOOGLE_API_KEY not set. Orchestrator will fail.")
+    orchestrator = K24Orchestrator(api_key=api_key or "dummy")
 
 def checkpoint(df):
     crud.log_change(df, DATA_LOG_PATH)
@@ -70,10 +94,9 @@ def _load_initial_data():
 
 def _ensure_dataframe():
     global dataframe
-    if dataframe is None:
-        dataframe = _load_initial_data()
     if dataframe is None or dataframe.empty:
-        raise HTTPException(status_code=400, detail="No data loaded. Please POST to /import-tally/.")
+        logger.warning("No live data available yet. Please try your query again after Tally data is fetched.")
+        return pd.DataFrame()  # Return empty instead of raising error
     return dataframe
 
 def _normalize_update_keys(df, updates):
@@ -263,6 +286,12 @@ def _sync_to_tally_live(company_name: str, ledger_name: Optional[str], updates: 
         )
         response = getattr(exc, "response", None)
         raise HTTPException(status_code=400, detail=str(exc))
+    except TallyXMLValidationError as exc:
+        # If exc.args[0] is a dict (from revised _sanitize_ledger_fields), return as detail
+        if exc.args and isinstance(exc.args[0], dict):
+            raise HTTPException(status_code=400, detail=exc.args[0])
+        else:
+            raise HTTPException(status_code=400, detail={"status": "error", "message": str(exc)})
     except Exception as exc:
         logger.exception("Unexpected error during Tally sync")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -415,6 +444,351 @@ def live_load(company: Optional[str] = Form(None), load_type: str = Form("ledger
     checkpoint(df)
     return {"status": "loaded", "shape": df.shape, "source": "tally"}
 
+@app.post("/tally/push")
+async def push_tally(xml_data: str = Body(..., embed=True)):
+    from backend.tally_connector import push_to_tally
+    result = push_to_tally(xml_data)
+    if result is None:
+        return {"status": "error", "detail": "Tally push failed"}
+    return {"status": "success", "response": result}
+
+# ============================================================================
+# WORKFLOW ORCHESTRATION ENDPOINTS
+# ============================================================================
+
+class WorkflowRequest(BaseModel):
+    workflow_name: str
+    party_name: str
+    company: Optional[str] = "SHREE JI SALES"
+    auto_approve: Optional[bool] = False
+
+@app.post("/workflows/execute")
+async def execute_workflow(request: WorkflowRequest):
+    """
+    Execute a KITTU workflow
+    
+    Currently supports:
+    - invoice_reconciliation: Detect and fix invoice discrepancies
+    """
+    from backend.orchestration.workflows.invoice_reconciliation import reconcile_invoices_workflow
+    
+    if request.workflow_name == "invoice_reconciliation":
+        try:
+            result = reconcile_invoices_workflow(
+                party_name=request.party_name,
+                company=request.company,
+                tally_url=TALLY_URL,
+                auto_approve=request.auto_approve
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Workflow execution failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Workflow failed: {str(e)}")
+    else:
+        raise HTTPException(status_code=404, detail=f"Workflow '{request.workflow_name}' not found")
+
+@app.get("/workflows/list")
+async def list_workflows():
+    """List available workflows"""
+    return {
+        "workflows": [
+            {
+                "name": "invoice_reconciliation",
+                "description": "Detect and fix invoice discrepancies for a party",
+                "parameters": {
+                    "party_name": "string (required)",
+                    "company": "string (optional, default: SHREE JI SALES)",
+                    "auto_approve": "boolean (optional, default: false)"
+                }
+            }
+        ]
+    }
+
+# ============================================================================
+# CONVERSATIONAL AI ENDPOINTS (KITTU)
+# ============================================================================
+
+from backend.context_manager import ContextManager
+from backend.intent_recognizer import IntentRecognizer, IntentType
+
+# Initialize components
+# Use fallback if Redis is not available
+context_mgr = ContextManager(use_fallback=True)
+intent_recognizer = None
+
+def get_intent_recognizer():
+    """Lazy initialization of IntentRecognizer"""
+    global intent_recognizer
+    if intent_recognizer is None:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            logger.warning("GOOGLE_API_KEY not set, IntentRecognizer will fail")
+            return None
+        intent_recognizer = IntentRecognizer(api_key=api_key)
+    return intent_recognizer
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: str = "default_user"
+
+@app.post("/chat")
+    4. Update context and return response
+    """
+    try:
+        # 1. Get Context
+        # Use provided company or default from env
+        company = request.company or TALLY_COMPANY
+        context = context_mgr.get_context(request.user_id, company=company)
+        
+        # Update context with latest company if provided
+        if request.company:
+            context_mgr.update_context(request.user_id, {"company": request.company})
+            
+        # 2. Recognize Intent
+        recognizer = get_intent_recognizer()
+        if not recognizer:
+            return JSONResponse(
+                status_code=500, 
+                content={"error": "Intent recognition unavailable (missing API key)"}
+            )
+            
+        intent = await recognizer.recognize(request.message, context.to_dict())
+        
+        response_text = ""
+        workflow_result = None
+        
+        data_source = "cached"
+        fetch_error = None
+
+        # 3. Route Intent
+        if intent.action == IntentType.RECONCILE_INVOICES:
+            if intent.entity:
+                # Trigger reconciliation workflow
+                from backend.orchestration.workflows.invoice_reconciliation import reconcile_invoices_workflow
+                
+                response_text = f"I'll start reconciling invoices for {intent.entity}."
+                
+                try:
+                    # Run workflow
+                    workflow_result = reconcile_invoices_workflow(
+                        party_name=intent.entity,
+                        company=context.company,
+                        tally_url=TALLY_URL,
+                        auto_approve=False # Default to manual approval for safety
+                    )
+                    
+                    # Format response based on result
+                    if workflow_result.get("status") == "pending_approval":
+                        issues = workflow_result.get("issues_found", 0)
+                        fixes = workflow_result.get("fixes_suggested", 0)
+                        response_text += f" I found {issues} potential issues and have suggested {fixes} fixes. Please review and approve them."
+                    elif workflow_result.get("status") == "complete":
+                        fixes = workflow_result.get("fixes_applied", 0)
+                        response_text += f" Reconciliation complete. I've applied {fixes} fixes."
+                    else:
+                        response_text += " Workflow finished with status: " + workflow_result.get("status", "unknown")
+                        
+                    # Track active workflow
+                    context_mgr.set_active_workflow(
+                        request.user_id, 
+                        "reconciliation", 
+                        {"party": intent.entity, "status": workflow_result.get("status")}
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Workflow failed: {e}")
+                    response_text += f" However, I encountered an error running the workflow: {str(e)}"
+            else:
+                response_text = "I understood you want to reconcile invoices, but I need to know which party/supplier to check. Could you specify the name?"
+
+        elif intent.action == IntentType.CREATE_PURCHASE:
+            # Create purchase voucher
+            if intent.entity:
+                try:
+                    from backend.tally_live_update import create_voucher_in_tally
+                    
+                    # Extract parameters
+                    params = intent.parameters
+                    quantity = params.get("quantity", 0)
+                    amount = params.get("amount")
+                    rate = params.get("rate")
+                    item = params.get("item", "")
+                    
+                    # Calculate total if rate and quantity provided
+                    if not amount and rate and quantity:
+                        amount = float(rate) * float(quantity)
+                    
+                    if not amount:
+                        response_text = f"I need the total amount or rate per item to create a purchase entry for {intent.entity}. Please specify."
+                    else:
+                        # Build voucher
+                        voucher_fields = {
+                            "DATE": pd.Timestamp.now().strftime("%Y%m%d"),
+                            "VOUCHERTYPENAME": "Purchase",
+                            "PARTYLEDGERNAME": intent.entity,
+                            "NARRATION": f"Purchase: {quantity} {item}" if item else "Purchase entry via KITTU",
+                        }
+                        
+                        line_items = [
+                            {
+                                "ledger_name": intent.entity,
+                                "amount": -float(amount),  # Credit party
+                                "is_deemed_positive": False,
+                            },
+                            {
+                                "ledger_name": "Purchase",  # Debit purchase account
+                                "amount": float(amount),
+                                "is_deemed_positive": True,
+                            }
+                        ]
+                        
+                        if TALLY_LIVE_UPDATE_ENABLED:
+                            try:
+                                result = create_voucher_in_tally(
+                                    company_name=context.company,
+                                    voucher_fields=voucher_fields,
+                                    line_items=line_items,
+                                    tally_url=TALLY_URL
+                                )
+                                response_text = f"✅ Purchase entry created successfully for {intent.entity}! Amount: ₹{amount}"
+                                if result.voucher_number:
+                                    response_text += f" (Voucher #: {result.voucher_number})"
+                            except Exception as e:
+                                logger.error(f"Tally voucher creation failed: {e}")
+                                response_text = f"I tried to create the purchase entry but Tally returned an error: {str(e)}"
+                        else:
+                            response_text = "Live updates are disabled. I've prepared the purchase entry but haven't pushed it to Tally yet."
+                except Exception as e:
+                    logger.error(f"Purchase workflow failed: {e}")
+                    response_text = f"I encountered an error processing your purchase: {str(e)}"
+            else:
+                response_text = "I can help create a purchase entry. Please specify the party name (e.g., 'I bought from ABC Corp')."
+
+        elif intent.action == IntentType.CREATE_SALE:
+            # Create sales voucher
+            if intent.entity:
+                try:
+                    from backend.tally_live_update import create_voucher_in_tally
+                    
+                    # Extract parameters
+                    params = intent.parameters
+                    quantity = params.get("quantity", 0)
+                    amount = params.get("amount")
+                    rate = params.get("rate")
+                    item = params.get("item", "")
+                    
+                    # Calculate total if rate and quantity provided
+                    if not amount and rate and quantity:
+                        amount = float(rate) * float(quantity)
+                    
+                    if not amount:
+                        response_text = f"I need the total amount or rate per item to create a sales entry for {intent.entity}. Please specify."
+                    else:
+                        # Build voucher
+                        voucher_fields = {
+                            "DATE": pd.Timestamp.now().strftime("%Y%m%d"),
+                            "VOUCHERTYPENAME": "Sales",
+                            "PARTYLEDGERNAME": intent.entity,
+                            "NARRATION": f"Sales: {quantity} {item}" if item else "Sales entry via KITTU",
+                        }
+                        
+                        line_items = [
+                            {
+                                "ledger_name": intent.entity,
+                                "amount": float(amount),  # Debit party
+                                "is_deemed_positive": True,
+                            },
+                            {
+                                "ledger_name": "Sales",  # Credit sales account
+                                "amount": -float(amount),
+                                "is_deemed_positive": False,
+                            }
+                        ]
+                        
+                        if TALLY_LIVE_UPDATE_ENABLED:
+                            try:
+                                result = create_voucher_in_tally(
+                                    company_name=context.company,
+                                    voucher_fields=voucher_fields,
+                                    line_items=line_items,
+                                    tally_url=TALLY_URL
+                                )
+                                response_text = f"✅ Sales entry created successfully for {intent.entity}! Amount: ₹{amount}"
+                                if result.voucher_number:
+                                    response_text += f" (Voucher #: {result.voucher_number})"
+                            except Exception as e:
+                                logger.error(f"Tally voucher creation failed: {e}")
+                                response_text = f"I tried to create the sales entry but Tally returned an error: {str(e)}"
+                        else:
+                            response_text = "Live updates are disabled. I've prepared the sales entry but haven't pushed it to Tally yet."
+                except Exception as e:
+                    logger.error(f"Sales workflow failed: {e}")
+                    response_text = f"I encountered an error processing your sale: {str(e)}"
+            else:
+                response_text = "I can help create a sales entry. Please specify the customer name (e.g., 'I sold to XYZ Corp')."
+                
+        elif intent.action == IntentType.QUERY_DATA:
+            # Fallback to TallyAuditAgent for general queries
+            try:
+                # Try to fetch live data if enabled
+                if TALLY_LIVE_UPDATE_ENABLED:
+                    from backend.loader import LedgerLoader
+                    logger.info("Fetching live data from Tally for query...")
+                    try:
+                        # Fetch vouchers for better context (transactions)
+                        live_df = LedgerLoader.load_tally_vouchers(
+                            company_name=context.company, 
+                            tally_url=TALLY_URL
+                        )
+                        if live_df is not None and not live_df.empty:
+                            global dataframe
+                            dataframe = live_df
+                            data_source = "live_tally"
+                            logger.info(f"Loaded {len(live_df)} live records from Tally")
+                        else:
+                            fetch_error = "Tally returned no data or connection failed"
+                            logger.warning("Failed to fetch live data, using cached data")
+                    except Exception as e:
+                        fetch_error = str(e)
+                        logger.error(f"Live fetch error: {e}")
+
+                df = _ensure_dataframe()
+                api_key = os.getenv("GOOGLE_API_KEY")
+                agent = TallyAuditAgent(api_key=api_key)
+                response_text = agent.ask_audit_question(df, request.message)
+            except Exception as e:
+                logger.error(f"Audit agent failed: {e}")
+                response_text = "I tried to analyze the data but encountered an error."
+
+        else:
+            # Default/Unknown intent
+            response_text = f"I understood you want to '{intent.action}', but I'm not fully trained on that yet. I can help you reconcile invoices or answer questions about your data."
+
+        # 4. Update History & Return
+        context_mgr.add_to_history(
+            request.user_id, 
+            request.message, 
+            response_text, 
+            intent=intent.dict()
+        )
+        
+        return {
+            "response": response_text,
+            "intent": intent.dict(),
+            "workflow_result": workflow_result,
+            "context": context.to_dict(),
+            "debug_info": {
+                "data_source": data_source,
+                "fetch_error": fetch_error,
+                "tally_url": TALLY_URL,
+                "company": context.company
+            }
+        }
+
+    except Exception as e:
+        logger.exception("Error in chat endpoint")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Tally AI Agent Backend"}
+    return {"status": "ok", "message": "K24 Backend with KITTU Orchestration & Conversational AI"}

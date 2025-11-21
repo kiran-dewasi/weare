@@ -8,6 +8,24 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tally_import")
 
+logger = logging.getLogger("tally_connector")
+TALLY_API_URL = "http://localhost:9000"
+
+def push_to_tally(xml_data):
+    """
+    Push XML data to Tally via XML API.
+    Implements retry and error handling for common failures.
+    """
+    try:
+        response = requests.post(TALLY_API_URL, data=xml_data, headers={'Content-Type': 'application/xml'})
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as e:
+        # Log error for diagnostics
+        logger.error(f"Tally XML push failed: {str(e)}")
+        # Optional: Add retry logic here
+        return None
+
 def parse_xml_safely(xml_text):
     try:
         return ET.fromstring(xml_text)
@@ -111,7 +129,13 @@ class TallyConnector:
         </ENVELOPE>
         """
         xml_response = self.send_request(xml)
-        return self._parse_voucher_xml(xml_response)
+        logger.info(f"Tally fetch_vouchers response size: {len(xml_response)} bytes")
+        if len(xml_response) < 500:
+            logger.info(f"Response preview: {xml_response}")
+        
+        df = self._parse_voucher_xml(xml_response)
+        logger.info(f"Parsed {len(df)} vouchers from response")
+        return df
 
     def push_voucher(self, company_name: Optional[str], voucher_xml: str) -> Dict[str, Any]:
         cname = company_name or self.company_name
@@ -152,11 +176,53 @@ class TallyConnector:
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
     @staticmethod
+    def _sanitize_xml(xml_text: str) -> str:
+        """
+        Robustly sanitize XML from Tally.
+        1. Removes invalid XML 1.0 characters (control chars).
+        2. Fixes common Tally issues like unescaped ampersands or invalid entities.
+        """
+        import re
+        
+        # 1. Remove invalid XML 1.0 characters
+        # Valid: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+        # We construct a regex to MATCH INVALID characters and replace them
+        # Note: We keep \t, \n, \r
+        xml_text = re.sub(r'[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]', '', xml_text)
+
+        # 2. Handle specific Tally garbage like &#x4; which is invalid in XML 1.0
+        # This regex finds numeric entities that resolve to invalid chars
+        def replace_entity(match):
+            try:
+                # Get the number
+                ent = match.group(1)
+                if ent.startswith('x'):
+                    val = int(ent[1:], 16)
+                else:
+                    val = int(ent)
+                # Check if valid
+                if (val == 0x9 or val == 0xA or val == 0xD or 
+                    (0x20 <= val <= 0xD7FF) or 
+                    (0xE000 <= val <= 0xFFFD) or 
+                    (0x10000 <= val <= 0x10FFFF)):
+                    return match.group(0) # Keep valid
+                return '' # Remove invalid
+            except:
+                return match.group(0)
+
+        xml_text = re.sub(r'&#(x?[0-9a-fA-F]+);', replace_entity, xml_text)
+        
+        return xml_text
+
+    @staticmethod
     def _parse_voucher_xml(xml_text: str) -> pd.DataFrame:
         try:
+            # Sanitize before parsing
+            xml_text = TallyConnector._sanitize_xml(xml_text)
             root = ET.fromstring(xml_text)
         except ET.ParseError as e:
-            logging.error(f"XML ParseError: {e}; raw: {xml_text[:2000]}")
+            logging.error(f"XML ParseError: {e}")
+            logging.error(f"First 2000 chars: {xml_text[:2000]}")
             return pd.DataFrame()
         rows = []
         for voucher in root.iter("VOUCHER"):

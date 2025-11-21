@@ -70,7 +70,12 @@ class TallyAgent:
             "You are a financial audit AI for Tally data.\n"
             f"Ledger:\n{data_str}\n"
             f"Audit instruction:\n{question}\n"
-            "Provide clear findings, anomalies, next steps."
+            "Provide a structured response in markdown format with the following sections:\n"
+            "### 📊 Summary\n"
+            "### 🔍 Key Findings\n"
+            "### ⚠️ Anomalies\n"
+            "### 💡 Recommendations\n"
+            "Keep it concise and professional."
         )
         msg = self.llm.invoke(audit_prompt)
         return getattr(msg, "content", str(msg))

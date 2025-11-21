@@ -166,9 +166,13 @@ def _sanitize_ledger_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
             continue
         sanitized[upper] = value
     if invalid:
-        raise TallyXMLValidationError(
-            f"Unsupported ledger fields for Tally update: {', '.join(sorted(set(invalid)))}"
-        )
+        # Instead of bare raising, produce a rich error dict for API use
+        raise TallyXMLValidationError({
+            "status": "error",
+            "message": f"Unsupported ledger fields for Tally update: {', '.join(sorted(set(invalid)))}",
+            "allowed_fields": sorted(list(LEDGER_ALLOWED_FIELDS)),
+            "invalid_fields": invalid
+        })
     return sanitized
 
 
@@ -182,7 +186,11 @@ def update_ledger_in_tally(
 ) -> TallyResponse:
     if not isinstance(field_updates, dict):
         raise TallyXMLValidationError("field_updates must be a dictionary")
-    sanitized = _sanitize_ledger_fields(field_updates)
+    try:
+        sanitized = _sanitize_ledger_fields(field_updates)
+    except TallyXMLValidationError as e:
+        # When catching TallyXMLValidationError, pass along any dict error as-is in the HTTPException detail.
+        raise e
     if not sanitized:
         raise TallyXMLValidationError(
             "No valid ledger fields supplied for update. "

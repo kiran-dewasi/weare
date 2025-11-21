@@ -1,3 +1,11 @@
 pandas
 requests
 pytest
+fastapi
+uvicorn
+python-dotenv
+langchain
+langchain-google-genai
+prefect>=2.14.0
+redis>=5.0.0
+
