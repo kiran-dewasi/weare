@@ -31,7 +31,9 @@ class K24Orchestrator:
         self.intent_recognizer = IntentRecognizer(api_key)
         self.context_manager = ContextManager(redis_url=redis_url)
         # Tally connector for lookups (not writes, writes go through draft confirmation)
-        self.tally = TallyConnector() 
+        import os
+        tally_url = os.getenv("TALLY_URL", "http://localhost:9000")
+        self.tally = TallyConnector(tally_url) 
         
     async def process_message(self, user_id: str, message: str) -> Dict[str, Any]:
         """

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Depends, BackgroundTasks, Security
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, Iterable
@@ -13,6 +13,8 @@ from backend.tally_live_update import (
     TallyIgnoredError,
 )
 from backend.tally_xml_builder import TallyXMLValidationError
+from backend.orchestration.workflows.update_gstin import update_gstin_workflow
+from backend.audit_engine import AuditEngine
 import io
 import os
 import logging
@@ -22,9 +24,22 @@ from fastapi.encoders import jsonable_encoder
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
 
-app = FastAPI(title="K24 Backend")
+API_KEY_NAME = "x-api-key"
+API_KEY = os.getenv("API_KEY", "k24-secret-key-123") # In production, use os.getenv("API_KEY")
+
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == API_KEY:
+        return api_key_header
+    raise HTTPException(status_code=403, detail="Could not validate credentials")
+
+from fastapi.middleware.cors import CORSMiddleware
+from backend.routers import reports, operations, gst
+
+app = FastAPI(title="K24 API", description="Financial Intelligence Engine")
 
 # Enable CORS for local development (allows chat_demo.html to talk to backend)
 app.add_middleware(
@@ -34,6 +49,11 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+# Include Routers
+app.include_router(reports.router)
+app.include_router(operations.router)
+app.include_router(gst.router)
 # Global simulated in-memory dataframe (single-user MVP)
 dataframe = None
 DATA_LOG_PATH = "data_log.pkl"
@@ -48,9 +68,40 @@ print(f"🚀 TALLY LIVE UPDATE ENABLED: {TALLY_LIVE_UPDATE_ENABLED}")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tally_api")
 from backend.orchestrator import K24Orchestrator
+from backend.database import init_db, get_db, Ledger, StockItem, Bill, Voucher
+from sqlalchemy.orm import Session
+from backend.orchestration.response_builder import ResponseBuilder, ResponseType
+from backend.orchestration.follow_up_manager import FollowUpManager
+@app.get("/audit/run", dependencies=[Depends(get_api_key)])
+def run_pre_audit(db: Session = Depends(get_db)):
+    """
+    Run Pre-Audit Compliance Check (Section 44AB)
+    Returns a comprehensive audit report with issues and recommendations
+    """
+    try:
+        audit_engine = AuditEngine(db)
+        report = audit_engine.run_full_audit()
+        return report
+    except Exception as e:
+        logger.error(f"Audit Engine Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Global Sync Instance
+from backend.sync_engine import SyncEngine # Assuming SyncEngine is a class
+sync_engine = SyncEngine()
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, func
+from datetime import datetime
+from typing import List
+
+# Initialize Shadow DB
+init_db()
 
 # Global Orchestrator instance
 orchestrator = None
+
+# Global FollowUpManager for conversation state
+follow_up_mgr = FollowUpManager()
 
 @app.on_event("startup")
 async def startup_event():
@@ -126,7 +177,7 @@ class ModifyRequest(BaseModel):
 class ImportXMLRequest(BaseModel):
     xml_input: str
 
-@app.post("/import-tally/")
+@app.post("/import-tally/", dependencies=[Depends(get_api_key)])
 def import_tally(req: ImportXMLRequest):
     global dataframe
     xml_text = req.xml_input
@@ -147,7 +198,7 @@ def import_tally(req: ImportXMLRequest):
 class AgentQuery(BaseModel):
     query: str
 
-@app.post("/ask-agent/")
+@app.post("/ask-agent/", dependencies=[Depends(get_api_key)])
 def ask_agent(request: AgentQuery):
     df = _ensure_dataframe()
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -160,13 +211,13 @@ def ask_agent(request: AgentQuery):
 class CustomerDetailsRequest(BaseModel):
     name: str
 
-@app.post("/customer-details/")
+@app.post("/customer-details/", dependencies=[Depends(get_api_key)])
 def customer_details(req: CustomerDetailsRequest):
     df = _ensure_dataframe()
     details = get_customer_details(df, req.name)
     return {"status": "ok", "name": req.name, "details": jsonable_encoder(details)}
 
-@app.get("/list-ledgers/")
+@app.get("/list-ledgers/", dependencies=[Depends(get_api_key)])
 def list_ledgers():
     try:
         df = _ensure_dataframe()
@@ -179,7 +230,7 @@ def list_ledgers():
         raise HTTPException(status_code=500, detail=str(e))
 # --------------------- End New Routes (minimal additions) ---------------------
 
-@app.post("/audit")
+@app.post("/audit", dependencies=[Depends(get_api_key)])
 def audit_entry(request: AuditRequest):
     df = _ensure_dataframe()
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -297,7 +348,7 @@ def _sync_to_tally_live(company_name: str, ledger_name: Optional[str], updates: 
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/modify")
+@app.post("/modify", dependencies=[Depends(get_api_key)])
 def modify_entry(request: ModifyRequest):
     df = _ensure_dataframe()
     checkpoint(df)
@@ -411,7 +462,7 @@ def modify_entry(request: ModifyRequest):
         logger.error(f"Error in modify_entry: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/load")
+@app.post("/load", dependencies=[Depends(get_api_key)])
 def load_ledger(file: UploadFile = File(...), filetype: str = Form("csv")):
     global dataframe
     content = file.file.read()
@@ -425,7 +476,7 @@ def load_ledger(file: UploadFile = File(...), filetype: str = Form("csv")):
     checkpoint(df)
     return {"status": "loaded", "shape": df.shape}
 
-@app.post("/live_load")
+@app.post("/live_load", dependencies=[Depends(get_api_key)])
 def live_load(company: Optional[str] = Form(None), load_type: str = Form("ledger")):
     """Load ledgers or vouchers live from Tally, fallback to CSV if error."""
     global dataframe
@@ -444,7 +495,7 @@ def live_load(company: Optional[str] = Form(None), load_type: str = Form("ledger
     checkpoint(df)
     return {"status": "loaded", "shape": df.shape, "source": "tally"}
 
-@app.post("/tally/push")
+@app.post("/tally/push", dependencies=[Depends(get_api_key)])
 async def push_tally(xml_data: str = Body(..., embed=True)):
     from backend.tally_connector import push_to_tally
     result = push_to_tally(xml_data)
@@ -462,7 +513,7 @@ class WorkflowRequest(BaseModel):
     company: Optional[str] = "SHREE JI SALES"
     auto_approve: Optional[bool] = False
 
-@app.post("/workflows/execute")
+@app.post("/workflows/execute", dependencies=[Depends(get_api_key)])
 async def execute_workflow(request: WorkflowRequest):
     """
     Execute a KITTU workflow
@@ -487,7 +538,7 @@ async def execute_workflow(request: WorkflowRequest):
     else:
         raise HTTPException(status_code=404, detail=f"Workflow '{request.workflow_name}' not found")
 
-@app.get("/workflows/list")
+@app.get("/workflows/list", dependencies=[Depends(get_api_key)])
 async def list_workflows():
     """List available workflows"""
     return {
@@ -530,8 +581,15 @@ def get_intent_recognizer():
 class ChatRequest(BaseModel):
     message: str
     user_id: str = "default_user"
+    company: Optional[str] = None # Allow user to specify company for chat
 
-@app.post("/chat")
+@app.post("/chat", dependencies=[Depends(get_api_key)])
+async def chat_endpoint(request: ChatRequest):
+    """
+    Main chat endpoint for KITTU.
+    1. Get Context
+    2. Recognize Intent
+    3. Route Intent to appropriate action (e.g., workflow, data query, Tally update)
     4. Update context and return response
     """
     try:
@@ -726,6 +784,32 @@ class ChatRequest(BaseModel):
                     response_text = f"I encountered an error processing your sale: {str(e)}"
             else:
                 response_text = "I can help create a sales entry. Please specify the customer name (e.g., 'I sold to XYZ Corp')."
+
+        elif intent.action == IntentType.UPDATE_GSTIN:
+            # Update GSTIN workflow
+            if intent.entity:
+                gstin = intent.parameters.get("gstin")
+                if not gstin:
+                    response_text = f"I can help update the GSTIN for {intent.entity}, but I need the new GST number. Please provide it."
+                else:
+                    try:
+                        result = update_gstin_workflow(
+                            party_name=intent.entity,
+                            new_gstin=gstin,
+                            company=context.company,
+                            tally_url=TALLY_URL
+                        )
+                        
+                        if result.get("status") == "success":
+                            response_text = f"✅ Successfully updated GSTIN for {intent.entity} to {gstin}."
+                        else:
+                            response_text = f"❌ Failed to update GSTIN: {result.get('message')}"
+                            
+                    except Exception as e:
+                        logger.error(f"GSTIN update failed: {e}")
+                        response_text = f"I encountered an error updating the GSTIN: {str(e)}"
+            else:
+                response_text = "I can help update a GSTIN. Please specify the party name and the new GST number."
                 
         elif intent.action == IntentType.QUERY_DATA:
             # Fallback to TallyAuditAgent for general queries
@@ -764,7 +848,59 @@ class ChatRequest(BaseModel):
             # Default/Unknown intent
             response_text = f"I understood you want to '{intent.action}', but I'm not fully trained on that yet. I can help you reconcile invoices or answer questions about your data."
 
-        # 4. Update History & Return
+
+        # 4. Check if we need follow-ups (using FollowUpManager)
+        conversation = follow_up_mgr.get_conversation(request.user_id)
+        
+        # Only start a conversation if:
+        # 1. User has CREATE_SALE or CREATE_PURCHASE intent
+        # 2. We have SOME information (entity or parameters) - not just a misclassified greeting
+        # 3. This is a genuine attempt to create something
+        should_start_conversation = (
+            not conversation and 
+            intent.action in [IntentType.CREATE_SALE, IntentType.CREATE_PURCHASE] and
+            (intent.entity or (intent.parameters and any(intent.parameters.values())))
+        )
+        
+        if should_start_conversation:
+            intent_str = "create_sale" if intent.action == IntentType.CREATE_SALE else "create_purchase"
+            conversation = follow_up_mgr.start_conversation(request.user_id, intent_str)
+            
+            # Extract slots from intent
+            slots = follow_up_mgr.extract_slots_from_intent({
+                "entity": intent.entity,
+                "parameters": intent.parameters
+            })
+            
+            # Update conversation with extracted slots
+            if slots:
+                follow_up_mgr.update_conversation(request.user_id, slots)
+        
+        # If we have an active conversation, check for missing slots
+        if conversation and follow_up_mgr.should_ask_follow_up(request.user_id):
+            next_question = follow_up_mgr.get_next_question(request.user_id)
+            missing_slots = conversation.get_missing_slots()
+            
+            # Update history
+            context_mgr.add_to_history(
+                request.user_id, 
+                request.message, 
+                next_question, 
+                intent=intent.dict()
+            )
+            
+            # Return follow-up question using ResponseBuilder
+            return ResponseBuilder.follow_up(
+                question=next_question,
+                missing_slots=missing_slots,
+                context={"intent": intent.action}
+            )
+        
+        # If conversation is complete, clear it
+        if conversation and conversation.is_complete():
+            follow_up_mgr.clear_conversation(request.user_id)
+        
+        # 5. Update History & Return with ResponseBuilder
         context_mgr.add_to_history(
             request.user_id, 
             request.message, 
@@ -772,22 +908,153 @@ class ChatRequest(BaseModel):
             intent=intent.dict()
         )
         
-        return {
-            "response": response_text,
-            "intent": intent.dict(),
-            "workflow_result": workflow_result,
-            "context": context.to_dict(),
-            "debug_info": {
-                "data_source": data_source,
-                "fetch_error": fetch_error,
-                "tally_url": TALLY_URL,
-                "company": context.company
+        # Use ResponseBuilder for structured response
+        return ResponseBuilder.text(
+            message=response_text,
+            metadata={
+                "intent": intent.dict(),
+                "workflow_result": workflow_result,
+                "context": context.to_dict(),
+                "debug_info": {
+                    "data_source": data_source,
+                    "fetch_error": fetch_error,
+                    "tally_url": TALLY_URL,
+                    "company": context.company
+                }
             }
-        }
+        )
 
     except Exception as e:
-        logger.exception("Error in chat endpoint")
+        logger.exception("Chat processing failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Headless Tally Endpoints (Shadow DB) ---
+
+@app.get("/ledgers", dependencies=[Depends(get_api_key)])
+def get_ledgers(db: Session = Depends(get_db)):
+    """Get all ledgers from Shadow DB (Instant)"""
+    return db.query(Ledger).all()
+
+@app.get("/items", dependencies=[Depends(get_api_key)])
+def get_items(db: Session = Depends(get_db)):
+    """Get all stock items from Shadow DB (Instant)"""
+    return db.query(StockItem).all()
+
+@app.get("/bills", dependencies=[Depends(get_api_key)])
+def get_bills(db: Session = Depends(get_db)):
+    """Get outstanding bills from Shadow DB (Instant)"""
+    return db.query(Bill).all()
+
+@app.get("/bills/receivables", dependencies=[Depends(get_api_key)])
+def get_receivables(db: Session = Depends(get_db)):
+    """Get only money owed TO us (Psychological: Anxiety Reduction)"""
+    # Assuming positive amount is receivable
+    return db.query(Bill).filter(Bill.amount > 0).all()
+
+@app.get("/dashboard/kpi", dependencies=[Depends(get_api_key)])
+def get_dashboard_kpi(db: Session = Depends(get_db)):
+    """
+    Get Key Performance Indicators for the Dashboard.
+    - Total Sales (from Vouchers)
+    - Total Receivables (from Bills)
+    - Total Payables (from Bills)
+    - Cash in Hand (from Ledgers)
+    """
+    try:
+        # 1. Total Sales (Sum of Sales Vouchers)
+        # In a real app, filter by date range (e.g., this month)
+        sales_total = db.query(func.sum(Voucher.amount)).filter(Voucher.voucher_type == "Sales").scalar() or 0.0
+        
+        # 2. Receivables & Payables (from Bills)
+        receivables = db.query(func.sum(Bill.amount)).filter(Bill.amount > 0).scalar() or 0.0
+        payables = db.query(func.sum(Bill.amount)).filter(Bill.amount < 0).scalar() or 0.0
+        
+        # 3. Cash in Hand (from Ledger)
+        # Assuming ledger name is "Cash"
+        cash_ledger = db.query(Ledger).filter(Ledger.name == "Cash").first()
+        cash_balance = cash_ledger.closing_balance if cash_ledger else 0.0
+        
+        return {
+            "sales": sales_total,
+            "receivables": receivables,
+            "payables": abs(payables), # Return positive number for display
+            "cash": cash_balance,
+            "last_updated": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"KPI Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reports/daybook", dependencies=[Depends(get_api_key)])
+def get_daybook(db: Session = Depends(get_db)):
+    """Get today's transactions (Psychological: Dopamine/Activity)"""
+    # For MVP, returning all. In real app, filter by date.
+    return db.query(Voucher).order_by(Voucher.date.desc()).all()
+
+@app.get("/search", dependencies=[Depends(get_api_key)])
+def global_search(q: str, db: Session = Depends(get_db)):
+    """Global Search (Psychological: Control)"""
+    ledgers = db.query(Ledger).filter(Ledger.name.ilike(f"%{q}%")).all()
+    items = db.query(StockItem).filter(StockItem.name.ilike(f"%{q}%")).all()
+    vouchers = db.query(Voucher).filter(or_(
+        Voucher.voucher_number.ilike(f"%{q}%"),
+        Voucher.party_name.ilike(f"%{q}%")
+    )).all()
+    
+    return {
+        "ledgers": ledgers,
+        "items": items,
+        "vouchers": vouchers
+    }
+
+@app.post("/sync", dependencies=[Depends(get_api_key)])
+async def trigger_sync(background_tasks: BackgroundTasks):
+    """Trigger Tally Sync in Background"""
+    background_tasks.add_task(sync_engine.sync_now)
+    return {"status": "Sync Started", "message": "Data is being pulled from Tally..."}
+
+class VoucherDraft(BaseModel):
+    voucher_type: str
+    party_name: str
+    amount: float
+    date: Optional[str] = None
+    narration: Optional[str] = None
+    items: Optional[List[Dict[str, Any]]] = []
+
+@app.post("/vouchers", dependencies=[Depends(get_api_key)])
+async def create_voucher_endpoint(voucher: VoucherDraft):
+    """
+    Create a voucher in Tally via the Sync Engine (Transactional).
+    """
+    try:
+        # 1. Construct voucher data
+        voucher_data = voucher.dict()
+        if not voucher_data.get('date'):
+            from datetime import datetime
+            voucher_data['date'] = datetime.now().strftime("%Y%m%d")
+
+        # 2. Use Transactional Push
+        result = sync_engine.push_voucher_safe(voucher_data)
+        
+        if result['success']:
+            return {"status": "success", "message": result['message'], "tally_response": result.get('tally_response')}
+        else:
+             return JSONResponse(status_code=400, content={"status": "error", "message": result['error'], "details": result.get('tally_response')})
+
+    except Exception as e:
+        logger.error(f"Failed to create voucher: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/vouchers/{voucher_id}/undo", dependencies=[Depends(get_api_key)])
+async def undo_voucher_endpoint(voucher_id: int):
+    """
+    Undo a voucher (Delete from Tally & Local DB).
+    """
+    result = sync_engine.undo_voucher_safe(voucher_id)
+    if result["success"]:
+        return {"status": "success", "message": result["message"]}
+    else:
+        return JSONResponse(status_code=400, content={"status": "error", "message": result["error"]})
 
 @app.get("/")
 def root():

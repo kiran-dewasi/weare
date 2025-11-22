@@ -33,6 +33,13 @@ def extract_entity_fallback(message: str, intent_action: str) -> Optional[str]:
             r'purchase.*from\s+([a-z0-9\s&]+?)(?:\s+\(|,|\.|$)',
             r'supplier\s+([a-z0-9\s&]+?)(?:\s+\(|,|\.|$)',
         ]
+    # Patterns for GSTIN updates
+    elif intent_action == "update_gstin":
+        patterns = [
+            r'gstin.*for\s+([a-z0-9\s&]+?)(?:\s+to\s+|\s+\(|,|\.|$)',
+            r'update\s+([a-z0-9\s&]+?)(?:\'s)?\s+gstin',
+            r'party\s+([a-z0-9\s&]+?)(?:\s+to\s+|\s+\(|,|\.|$)',
+        ]
     else:
         return None
     
@@ -48,7 +55,7 @@ def extract_entity_fallback(message: str, intent_action: str) -> Optional[str]:
 
 def extract_parameters_fallback(message: str) -> Dict[str, Any]:
     """
-    Extract parameters (quantity, amount, rate, item) using regex.
+    Extract parameters (quantity, amount, rate, item, gstin) using regex.
     
     Args:
         message: User's natural language message
@@ -59,6 +66,13 @@ def extract_parameters_fallback(message: str) -> Dict[str, Any]:
     params = {}
     message_lower = message.lower()
     
+    # Extract GSTIN (Standard format: 22AAAAA0000A1Z5)
+    # We use a slightly looser regex for extraction to catch potential user inputs
+    gstin_pattern = r'\b\d{2}[a-z]{5}\d{4}[a-z]{1}[1-9a-z]{1}z[0-9a-z]{1}\b'
+    match = re.search(gstin_pattern, message_lower)
+    if match:
+        params['gstin'] = match.group(0).upper()
+
     # Extract quantity
     qty_patterns = [
         r'(\d+)\s*(?:bags?|units?|items?|pieces?)',
