@@ -4,8 +4,14 @@ pytest
 fastapi
 uvicorn
 python-dotenv
+python-multipart
 langchain
 langchain-google-genai
-prefect>=2.14.0
-redis>=5.0.0
-
+langchain-core
+langgraph
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator
+tenacity
+pydantic

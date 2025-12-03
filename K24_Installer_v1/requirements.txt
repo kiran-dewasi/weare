@@ -1,0 +1,13 @@
+pandas
+requests
+pytest
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+langchain
+langchain-google-genai
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator

@@ -15,6 +15,7 @@ from backend.tally_live_update import (
 from backend.tally_xml_builder import TallyXMLValidationError
 from backend.orchestration.workflows.update_gstin import update_gstin_workflow
 from backend.audit_engine import AuditEngine
+from backend.compliance.gst_engine import GSTEngine
 import io
 import os
 import logging
@@ -37,7 +38,9 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
     raise HTTPException(status_code=403, detail="Could not validate credentials")
 
 from fastapi.middleware.cors import CORSMiddleware
-from backend.routers import reports, operations, gst
+from backend.routers import reports, operations, gst, setup, debug, compliance, auth, agent
+from backend.compliance.audit_service import AuditService
+from typing import Optional
 
 app = FastAPI(title="K24 API", description="Financial Intelligence Engine")
 
@@ -51,9 +54,14 @@ app.add_middleware(
 )
 
 # Include Routers
+app.include_router(auth.router)  # Auth first (no API key required)
+app.include_router(agent.router) # AI Agent router
 app.include_router(reports.router)
 app.include_router(operations.router)
 app.include_router(gst.router)
+app.include_router(setup.router)
+app.include_router(debug.router)
+app.include_router(compliance.router)
 # Global simulated in-memory dataframe (single-user MVP)
 dataframe = None
 DATA_LOG_PATH = "data_log.pkl"
@@ -64,6 +72,9 @@ LIVE_SYNC = bool(os.getenv("TALLY_LIVE_SYNC", ""))
 TALLY_LIVE_UPDATE_ENABLED = os.getenv("TALLY_LIVE_UPDATE_ENABLED", "true").lower() == "true"
 print(f"🚀 TALLY LIVE UPDATE ENABLED: {TALLY_LIVE_UPDATE_ENABLED}")
 
+# Initialize Tally Connector
+tally = TallyConnector(url=TALLY_URL, company_name=TALLY_COMPANY)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tally_api")
@@ -72,14 +83,37 @@ from backend.database import init_db, get_db, Ledger, StockItem, Bill, Voucher
 from sqlalchemy.orm import Session
 from backend.orchestration.response_builder import ResponseBuilder, ResponseType
 from backend.orchestration.follow_up_manager import FollowUpManager
+from backend.sync.sync_monitor import monitor as sync_monitor
+
+# Initialize Orchestrator
+import json
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if os.path.exists("k24_config.json"):
+    try:
+        with open("k24_config.json", "r") as f:
+            config = json.load(f)
+            GOOGLE_API_KEY = config.get("google_api_key", GOOGLE_API_KEY)
+    except:
+        pass
+
+orchestrator = None
+if GOOGLE_API_KEY:
+    try:
+        orchestrator = K24Orchestrator(api_key=GOOGLE_API_KEY)
+        logger.info("Orchestrator initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to init Orchestrator: {e}")
+else:
+    logger.warning("GOOGLE_API_KEY not found. Chat will not work.")
 @app.get("/audit/run", dependencies=[Depends(get_api_key)])
-def run_pre_audit(db: Session = Depends(get_db)):
+def run_pre_audit():
     """
     Run Pre-Audit Compliance Check (Section 44AB)
     Returns a comprehensive audit report with issues and recommendations
     """
     try:
-        audit_engine = AuditEngine(db)
+        # Use the global 'tally' instance
+        audit_engine = AuditEngine(tally)
         report = audit_engine.run_full_audit()
         return report
     except Exception as e:
@@ -110,6 +144,13 @@ async def startup_event():
     if not api_key:
         logger.warning("GOOGLE_API_KEY not set. Orchestrator will fail.")
     orchestrator = K24Orchestrator(api_key=api_key or "dummy")
+    
+    # Initialize AI Agent Orchestrator
+    try:
+        agent.init_orchestrator()
+        logger.info("✅ AI Agent orchestrator initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize AI Agent: {e}")
 
 def checkpoint(df):
     crud.log_change(df, DATA_LOG_PATH)
@@ -217,17 +258,316 @@ def customer_details(req: CustomerDetailsRequest):
     details = get_customer_details(df, req.name)
     return {"status": "ok", "name": req.name, "details": jsonable_encoder(details)}
 
-@app.get("/list-ledgers/", dependencies=[Depends(get_api_key)])
-def list_ledgers():
+@app.get("/vouchers", dependencies=[Depends(get_api_key)])
+async def get_vouchers(voucher_type: Optional[str] = None, db: Session = Depends(get_db)):
+    """Fetch vouchers from K24 Database (fast local access)"""
     try:
-        df = _ensure_dataframe()
-        rows = jsonable_encoder(df.to_dict(orient="records"))
-        return {"status": "ok", "rows": rows}
-    except HTTPException as e:
-        raise
+        # Query from database instead of Tally (much faster + shows recent entries)
+        query = db.query(Voucher).order_by(Voucher.date.desc())
+        
+        if voucher_type:
+            query = query.filter(Voucher.voucher_type == voucher_type)
+        
+        vouchers = query.all()
+        
+        # Convert to dict format
+        voucher_list = [{
+            "date": v.date.strftime("%Y-%m-%d") if v.date else "",
+            "voucher_type": v.voucher_type,
+            "voucher_number": v.voucher_number,
+            "party_name": v.party_name,
+            "amount": v.amount,
+            "narration": v.narration,
+            "sync_status": v.sync_status
+        } for v in vouchers]
+        
+        return {"vouchers": voucher_list}
     except Exception as e:
-        logging.error(f"Error in list_ledgers: {e}")
+        logger.exception("Failed to fetch vouchers from database")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/ledgers/{ledger_name}/vouchers", dependencies=[Depends(get_api_key)])
+async def get_ledger_vouchers(ledger_name: str):
+    """Fetch vouchers for a specific ledger"""
+    try:
+        # Decode ledger name if needed, but FastAPI handles URL decoding
+        df = tally.fetch_ledger_vouchers(ledger_name)
+        if df.empty:
+            return {"vouchers": []}
+        return {"vouchers": df.to_dict(orient="records")}
+    except Exception as e:
+        logger.exception(f"Failed to fetch vouchers for {ledger_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/reports/outstanding", dependencies=[Depends(get_api_key)])
+async def get_outstanding_bills():
+    """Fetch outstanding bills"""
+    try:
+        df = tally.fetch_outstanding_bills()
+        if df.empty:
+            return {"bills": []}
+        return {"bills": df.to_dict(orient="records")}
+    except Exception as e:
+        logger.exception("Failed to fetch outstanding bills")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/ledgers/search", dependencies=[Depends(get_api_key)])
+async def search_ledgers(query: str):
+    """Search ledgers for autocomplete"""
+    try:
+        matches = tally.lookup_ledger(query)
+        return {"matches": matches}
+    except Exception as e:
+        logger.exception(f"Failed to search ledgers for '{query}'")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ReceiptVoucherRequest(BaseModel):
+    party_name: str
+    amount: float
+    deposit_to: str = "Cash"
+    narration: str = ""
+    date: str  # YYYY-MM-DD
+    reason: Optional[str] = "New Entry"
+
+@app.post("/vouchers/receipt", dependencies=[Depends(get_api_key)])
+async def create_receipt_voucher(request: ReceiptVoucherRequest, db: Session = Depends(get_db)):
+    """Create a Receipt voucher and push to Tally + Save to Database"""
+    try:
+        # Convert date format YYYY-MM-DD to YYYYMMDD
+        date_obj = datetime.strptime(request.date, "%Y-%m-%d")
+        tally_date = date_obj.strftime("%Y%m%d")
+        
+        # Prepare voucher data for Tally
+        voucher_data = {
+            "voucher_type": "Receipt",
+            "date": tally_date,
+            "party_name": request.party_name,
+            "amount": request.amount,
+            "narration": request.narration or f"Receipt from {request.party_name}",
+            "deposit_to": request.deposit_to
+        }
+        
+        # Push to Tally FIRST
+        result = tally.create_voucher(voucher_data)
+        
+        tally_success = result.get("status") == "OK" or "Success" in str(result.get("raw", ""))
+        
+        # Save to Database (even if Tally fails, for offline tracking)
+        voucher_record = Voucher(
+            guid=f"K24-{datetime.now().timestamp()}",  # Generate temp GUID
+            voucher_number=f"RCP-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            date=date_obj,
+            voucher_type="Receipt",
+            party_name=request.party_name,
+            amount=request.amount,
+            narration=request.narration or f"Receipt from {request.party_name}",
+            sync_status="SYNCED" if tally_success else "ERROR"
+        )
+        db.add(voucher_record)
+        db.commit()
+        db.refresh(voucher_record)
+        
+        # 🛡️ AUDIT LOGGING (MCA Compliance)
+        AuditService.log_change(
+            db=db,
+            entity_type="Voucher",
+            entity_id=voucher_record.voucher_number,
+            action="CREATE",
+            user_id="kiran",  # TODO: Get from auth context
+            old_data=None,
+            new_data={
+                "amount": request.amount,
+                "party": request.party_name,
+                "date": request.date
+            },
+            reason=request.reason or "New Entry"
+        )
+        
+        if tally_success:
+            return {
+                "status": "success",
+                "message": f"Receipt voucher created for ₹{request.amount}",
+                "voucher": voucher_data,
+                "db_id": voucher_record.id
+            }
+        else:
+            logger.warning(f"Tally rejected voucher but saved to DB: {result.get('status')}")
+            return {
+                "status": "partial",
+                "message": f"Receipt saved to K24 but Tally sync failed. Will retry later.",
+                "voucher": voucher_data,
+                "db_id": voucher_record.id,
+                "tally_error": result.get('status', 'Unknown error')
+            }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+    except Exception as e:
+        logger.exception("Failed to create receipt voucher")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class SalesInvoiceItem(BaseModel):
+    description: str
+    quantity: float
+    rate: float
+    amount: float
+
+class SalesInvoiceRequest(BaseModel):
+    party_name: str
+    invoice_number: str = ""
+    date: str  # YYYY-MM-DD
+    items: list[SalesInvoiceItem]
+    subtotal: float
+    discount_percent: float = 0
+    discount_amount: float = 0
+    gst_rate: float = 0
+    gst_amount: float = 0
+    grand_total: float
+    narration: str = ""
+
+@app.post("/vouchers/sales", dependencies=[Depends(get_api_key)])
+async def create_sales_invoice(request: SalesInvoiceRequest, db: Session = Depends(get_db)):
+    """Create a Sales Invoice with multiple line items and push to Tally + Save to Database"""
+    try:
+        # Convert date format
+        date_obj = datetime.strptime(request.date, "%Y-%m-%d")
+        tally_date = date_obj.strftime("%Y%m%d")
+        
+        # Prepare voucher data for Tally
+        voucher_data = {
+            "voucher_type": "Sales",
+            "date": tally_date,
+            "party_name": request.party_name,
+            "amount": request.grand_total,
+            "narration": request.narration or f"Sales Invoice for {request.party_name}",
+            "items": [
+                {
+                    "name": item.description,
+                    "quantity": item.quantity,
+                    "rate": item.rate,
+                    "amount": item.amount
+                }
+                for item in request.items
+            ]
+        }
+        
+        # Push to Tally FIRST
+        result = tally.create_voucher(voucher_data)
+        
+        tally_success = result.get("status") == "OK" or "Success" in str(result.get("raw", ""))
+        
+        # Save to Database
+        voucher_record = Voucher(
+            guid=f"K24-{datetime.now().timestamp()}",
+            voucher_number=request.invoice_number or f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            date=date_obj,
+            voucher_type="Sales",
+            party_name=request.party_name,
+            amount=request.grand_total,
+            narration=request.narration or f"Sales Invoice for {request.party_name}",
+            sync_status="SYNCED" if tally_success else "ERROR"
+        )
+        db.add(voucher_record)
+        db.commit()
+        db.refresh(voucher_record)
+        
+        if tally_success:
+            return {
+                "status": "success",
+                "message": f"Sales Invoice created for ₹{request.grand_total:,.2f}",
+                "invoice": {
+                    "party": request.party_name,
+                    "total": request.grand_total,
+                    "items_count": len(request.items),
+                    "gst_amount": request.gst_amount
+                },
+                "db_id": voucher_record.id
+            }
+        else:
+            logger.warning(f"Tally rejected invoice but saved to DB: {result.get('status')}")
+            return {
+                "status": "partial",
+                "message": f"Invoice saved to K24 but Tally sync failed",
+                "invoice": {
+                    "party": request.party_name,
+                    "total": request.grand_total,
+                    "items_count": len(request.items)
+                },
+                "db_id": voucher_record.id,
+                "tally_error": result.get('status', 'Unknown error')
+            }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+    except Exception as e:
+        logger.exception("Failed to create sales invoice")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class PaymentVoucherRequest(BaseModel):
+    party_name: str
+    amount: float
+    bank_cash_ledger: str = "Cash"
+    narration: str = ""
+    date: str = datetime.now().strftime("%Y-%m-%d")
+
+@app.post("/vouchers/payment", dependencies=[Depends(get_api_key)])
+async def create_payment_voucher(request: PaymentVoucherRequest, db: Session = Depends(get_db)):
+    """Create a Payment voucher and push to Tally + Save to Database"""
+    try:
+        # Convert date format
+        date_obj = datetime.strptime(request.date, "%Y-%m-%d")
+        tally_date = date_obj.strftime("%Y%m%d")
+        
+        # Prepare voucher data for Tally
+        voucher_data = {
+            "voucher_type": "Payment",
+            "date": tally_date,
+            "party_name": request.party_name,
+            "amount": request.amount,
+            "narration": request.narration or f"Payment to {request.party_name}",
+            "deposit_to": request.bank_cash_ledger # In Tally logic, this is the Credit ledger (Cash/Bank)
+        }
+        
+        # Push to Tally FIRST
+        result = tally.create_voucher(voucher_data)
+        
+        tally_success = result.get("status") == "OK" or "Success" in str(result.get("raw", ""))
+        
+        # Save to Database
+        voucher_record = Voucher(
+            guid=f"K24-{datetime.now().timestamp()}",
+            voucher_number=f"PAY-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            date=date_obj,
+            voucher_type="Payment",
+            party_name=request.party_name,
+            amount=request.amount,
+            narration=request.narration or f"Payment to {request.party_name}",
+            sync_status="SYNCED" if tally_success else "ERROR"
+        )
+        db.add(voucher_record)
+        db.commit()
+        db.refresh(voucher_record)
+        
+        if tally_success:
+            return {
+                "status": "success",
+                "message": f"Payment created for ₹{request.amount}",
+                "voucher": voucher_data,
+                "db_id": voucher_record.id
+            }
+        else:
+            logger.warning(f"Tally rejected payment but saved to DB: {result.get('status')}")
+            return {
+                "status": "partial",
+                "message": f"Payment saved to K24 but Tally sync failed",
+                "voucher": voucher_data,
+                "db_id": voucher_record.id,
+                "tally_error": result.get('status', 'Unknown error')
+            }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+    except Exception as e:
+        logger.exception("Failed to create payment voucher")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --------------------- End New Routes (minimal additions) ---------------------
 
 @app.post("/audit", dependencies=[Depends(get_api_key)])
@@ -578,351 +918,36 @@ def get_intent_recognizer():
         intent_recognizer = IntentRecognizer(api_key=api_key)
     return intent_recognizer
 
+@app.get("/sync/status", dependencies=[Depends(get_api_key)])
+def get_sync_status():
+    """Get current sync health status"""
+    return sync_monitor.get_health_report()
+
 class ChatRequest(BaseModel):
     message: str
     user_id: str = "default_user"
     company: Optional[str] = None # Allow user to specify company for chat
+    client_context: Optional[Dict[str, Any]] = None # Context from frontend (e.g. current page)
+    active_draft: Optional[Dict[str, Any]] = None
 
 @app.post("/chat", dependencies=[Depends(get_api_key)])
 async def chat_endpoint(request: ChatRequest):
     """
     Main chat endpoint for KITTU.
-    1. Get Context
-    2. Recognize Intent
-    3. Route Intent to appropriate action (e.g., workflow, data query, Tally update)
-    4. Update context and return response
+    Delegates to the K24Orchestrator ("The Director").
     """
     try:
-        # 1. Get Context
-        # Use provided company or default from env
-        company = request.company or TALLY_COMPANY
-        context = context_mgr.get_context(request.user_id, company=company)
-        
-        # Update context with latest company if provided
-        if request.company:
-            context_mgr.update_context(request.user_id, {"company": request.company})
-            
-        # 2. Recognize Intent
-        recognizer = get_intent_recognizer()
-        if not recognizer:
-            return JSONResponse(
-                status_code=500, 
-                content={"error": "Intent recognition unavailable (missing API key)"}
-            )
-            
-        intent = await recognizer.recognize(request.message, context.to_dict())
-        
-        response_text = ""
-        workflow_result = None
-        
-        data_source = "cached"
-        fetch_error = None
+        if not orchestrator:
+            raise HTTPException(status_code=500, detail="Orchestrator not initialized")
 
-        # 3. Route Intent
-        if intent.action == IntentType.RECONCILE_INVOICES:
-            if intent.entity:
-                # Trigger reconciliation workflow
-                from backend.orchestration.workflows.invoice_reconciliation import reconcile_invoices_workflow
-                
-                response_text = f"I'll start reconciling invoices for {intent.entity}."
-                
-                try:
-                    # Run workflow
-                    workflow_result = reconcile_invoices_workflow(
-                        party_name=intent.entity,
-                        company=context.company,
-                        tally_url=TALLY_URL,
-                        auto_approve=False # Default to manual approval for safety
-                    )
-                    
-                    # Format response based on result
-                    if workflow_result.get("status") == "pending_approval":
-                        issues = workflow_result.get("issues_found", 0)
-                        fixes = workflow_result.get("fixes_suggested", 0)
-                        response_text += f" I found {issues} potential issues and have suggested {fixes} fixes. Please review and approve them."
-                    elif workflow_result.get("status") == "complete":
-                        fixes = workflow_result.get("fixes_applied", 0)
-                        response_text += f" Reconciliation complete. I've applied {fixes} fixes."
-                    else:
-                        response_text += " Workflow finished with status: " + workflow_result.get("status", "unknown")
-                        
-                    # Track active workflow
-                    context_mgr.set_active_workflow(
-                        request.user_id, 
-                        "reconciliation", 
-                        {"party": intent.entity, "status": workflow_result.get("status")}
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Workflow failed: {e}")
-                    response_text += f" However, I encountered an error running the workflow: {str(e)}"
-            else:
-                response_text = "I understood you want to reconcile invoices, but I need to know which party/supplier to check. Could you specify the name?"
-
-        elif intent.action == IntentType.CREATE_PURCHASE:
-            # Create purchase voucher
-            if intent.entity:
-                try:
-                    from backend.tally_live_update import create_voucher_in_tally
-                    
-                    # Extract parameters
-                    params = intent.parameters
-                    quantity = params.get("quantity", 0)
-                    amount = params.get("amount")
-                    rate = params.get("rate")
-                    item = params.get("item", "")
-                    
-                    # Calculate total if rate and quantity provided
-                    if not amount and rate and quantity:
-                        amount = float(rate) * float(quantity)
-                    
-                    if not amount:
-                        response_text = f"I need the total amount or rate per item to create a purchase entry for {intent.entity}. Please specify."
-                    else:
-                        # Build voucher
-                        voucher_fields = {
-                            "DATE": pd.Timestamp.now().strftime("%Y%m%d"),
-                            "VOUCHERTYPENAME": "Purchase",
-                            "PARTYLEDGERNAME": intent.entity,
-                            "NARRATION": f"Purchase: {quantity} {item}" if item else "Purchase entry via KITTU",
-                        }
-                        
-                        line_items = [
-                            {
-                                "ledger_name": intent.entity,
-                                "amount": -float(amount),  # Credit party
-                                "is_deemed_positive": False,
-                            },
-                            {
-                                "ledger_name": "Purchase",  # Debit purchase account
-                                "amount": float(amount),
-                                "is_deemed_positive": True,
-                            }
-                        ]
-                        
-                        if TALLY_LIVE_UPDATE_ENABLED:
-                            try:
-                                result = create_voucher_in_tally(
-                                    company_name=context.company,
-                                    voucher_fields=voucher_fields,
-                                    line_items=line_items,
-                                    tally_url=TALLY_URL
-                                )
-                                response_text = f"✅ Purchase entry created successfully for {intent.entity}! Amount: ₹{amount}"
-                                if result.voucher_number:
-                                    response_text += f" (Voucher #: {result.voucher_number})"
-                            except Exception as e:
-                                logger.error(f"Tally voucher creation failed: {e}")
-                                response_text = f"I tried to create the purchase entry but Tally returned an error: {str(e)}"
-                        else:
-                            response_text = "Live updates are disabled. I've prepared the purchase entry but haven't pushed it to Tally yet."
-                except Exception as e:
-                    logger.error(f"Purchase workflow failed: {e}")
-                    response_text = f"I encountered an error processing your purchase: {str(e)}"
-            else:
-                response_text = "I can help create a purchase entry. Please specify the party name (e.g., 'I bought from ABC Corp')."
-
-        elif intent.action == IntentType.CREATE_SALE:
-            # Create sales voucher
-            if intent.entity:
-                try:
-                    from backend.tally_live_update import create_voucher_in_tally
-                    
-                    # Extract parameters
-                    params = intent.parameters
-                    quantity = params.get("quantity", 0)
-                    amount = params.get("amount")
-                    rate = params.get("rate")
-                    item = params.get("item", "")
-                    
-                    # Calculate total if rate and quantity provided
-                    if not amount and rate and quantity:
-                        amount = float(rate) * float(quantity)
-                    
-                    if not amount:
-                        response_text = f"I need the total amount or rate per item to create a sales entry for {intent.entity}. Please specify."
-                    else:
-                        # Build voucher
-                        voucher_fields = {
-                            "DATE": pd.Timestamp.now().strftime("%Y%m%d"),
-                            "VOUCHERTYPENAME": "Sales",
-                            "PARTYLEDGERNAME": intent.entity,
-                            "NARRATION": f"Sales: {quantity} {item}" if item else "Sales entry via KITTU",
-                        }
-                        
-                        line_items = [
-                            {
-                                "ledger_name": intent.entity,
-                                "amount": float(amount),  # Debit party
-                                "is_deemed_positive": True,
-                            },
-                            {
-                                "ledger_name": "Sales",  # Credit sales account
-                                "amount": -float(amount),
-                                "is_deemed_positive": False,
-                            }
-                        ]
-                        
-                        if TALLY_LIVE_UPDATE_ENABLED:
-                            try:
-                                result = create_voucher_in_tally(
-                                    company_name=context.company,
-                                    voucher_fields=voucher_fields,
-                                    line_items=line_items,
-                                    tally_url=TALLY_URL
-                                )
-                                response_text = f"✅ Sales entry created successfully for {intent.entity}! Amount: ₹{amount}"
-                                if result.voucher_number:
-                                    response_text += f" (Voucher #: {result.voucher_number})"
-                            except Exception as e:
-                                logger.error(f"Tally voucher creation failed: {e}")
-                                response_text = f"I tried to create the sales entry but Tally returned an error: {str(e)}"
-                        else:
-                            response_text = "Live updates are disabled. I've prepared the sales entry but haven't pushed it to Tally yet."
-                except Exception as e:
-                    logger.error(f"Sales workflow failed: {e}")
-                    response_text = f"I encountered an error processing your sale: {str(e)}"
-            else:
-                response_text = "I can help create a sales entry. Please specify the customer name (e.g., 'I sold to XYZ Corp')."
-
-        elif intent.action == IntentType.UPDATE_GSTIN:
-            # Update GSTIN workflow
-            if intent.entity:
-                gstin = intent.parameters.get("gstin")
-                if not gstin:
-                    response_text = f"I can help update the GSTIN for {intent.entity}, but I need the new GST number. Please provide it."
-                else:
-                    try:
-                        result = update_gstin_workflow(
-                            party_name=intent.entity,
-                            new_gstin=gstin,
-                            company=context.company,
-                            tally_url=TALLY_URL
-                        )
-                        
-                        if result.get("status") == "success":
-                            response_text = f"✅ Successfully updated GSTIN for {intent.entity} to {gstin}."
-                        else:
-                            response_text = f"❌ Failed to update GSTIN: {result.get('message')}"
-                            
-                    except Exception as e:
-                        logger.error(f"GSTIN update failed: {e}")
-                        response_text = f"I encountered an error updating the GSTIN: {str(e)}"
-            else:
-                response_text = "I can help update a GSTIN. Please specify the party name and the new GST number."
-                
-        elif intent.action == IntentType.QUERY_DATA:
-            # Fallback to TallyAuditAgent for general queries
-            try:
-                # Try to fetch live data if enabled
-                if TALLY_LIVE_UPDATE_ENABLED:
-                    from backend.loader import LedgerLoader
-                    logger.info("Fetching live data from Tally for query...")
-                    try:
-                        # Fetch vouchers for better context (transactions)
-                        live_df = LedgerLoader.load_tally_vouchers(
-                            company_name=context.company, 
-                            tally_url=TALLY_URL
-                        )
-                        if live_df is not None and not live_df.empty:
-                            global dataframe
-                            dataframe = live_df
-                            data_source = "live_tally"
-                            logger.info(f"Loaded {len(live_df)} live records from Tally")
-                        else:
-                            fetch_error = "Tally returned no data or connection failed"
-                            logger.warning("Failed to fetch live data, using cached data")
-                    except Exception as e:
-                        fetch_error = str(e)
-                        logger.error(f"Live fetch error: {e}")
-
-                df = _ensure_dataframe()
-                api_key = os.getenv("GOOGLE_API_KEY")
-                agent = TallyAuditAgent(api_key=api_key)
-                response_text = agent.ask_audit_question(df, request.message)
-            except Exception as e:
-                logger.error(f"Audit agent failed: {e}")
-                response_text = "I tried to analyze the data but encountered an error."
-
-        else:
-            # Default/Unknown intent
-            response_text = f"I understood you want to '{intent.action}', but I'm not fully trained on that yet. I can help you reconcile invoices or answer questions about your data."
-
-
-        # 4. Check if we need follow-ups (using FollowUpManager)
-        conversation = follow_up_mgr.get_conversation(request.user_id)
-        
-        # Only start a conversation if:
-        # 1. User has CREATE_SALE or CREATE_PURCHASE intent
-        # 2. We have SOME information (entity or parameters) - not just a misclassified greeting
-        # 3. This is a genuine attempt to create something
-        should_start_conversation = (
-            not conversation and 
-            intent.action in [IntentType.CREATE_SALE, IntentType.CREATE_PURCHASE] and
-            (intent.entity or (intent.parameters and any(intent.parameters.values())))
+        # Pass request to the Director
+        response_data = await orchestrator.process_message(
+            user_id=request.user_id,
+            message=request.message,
+            active_draft=request.active_draft
         )
         
-        if should_start_conversation:
-            intent_str = "create_sale" if intent.action == IntentType.CREATE_SALE else "create_purchase"
-            conversation = follow_up_mgr.start_conversation(request.user_id, intent_str)
-            
-            # Extract slots from intent
-            slots = follow_up_mgr.extract_slots_from_intent({
-                "entity": intent.entity,
-                "parameters": intent.parameters
-            })
-            
-            # Update conversation with extracted slots
-            if slots:
-                follow_up_mgr.update_conversation(request.user_id, slots)
-        
-        # If we have an active conversation, check for missing slots
-        if conversation and follow_up_mgr.should_ask_follow_up(request.user_id):
-            next_question = follow_up_mgr.get_next_question(request.user_id)
-            missing_slots = conversation.get_missing_slots()
-            
-            # Update history
-            context_mgr.add_to_history(
-                request.user_id, 
-                request.message, 
-                next_question, 
-                intent=intent.dict()
-            )
-            
-            # Return follow-up question using ResponseBuilder
-            return ResponseBuilder.follow_up(
-                question=next_question,
-                missing_slots=missing_slots,
-                context={"intent": intent.action}
-            )
-        
-        # If conversation is complete, clear it
-        if conversation and conversation.is_complete():
-            follow_up_mgr.clear_conversation(request.user_id)
-        
-        # 5. Update History & Return with ResponseBuilder
-        context_mgr.add_to_history(
-            request.user_id, 
-            request.message, 
-            response_text, 
-            intent=intent.dict()
-        )
-        
-        # Use ResponseBuilder for structured response
-        return ResponseBuilder.text(
-            message=response_text,
-            metadata={
-                "intent": intent.dict(),
-                "workflow_result": workflow_result,
-                "context": context.to_dict(),
-                "debug_info": {
-                    "data_source": data_source,
-                    "fetch_error": fetch_error,
-                    "tally_url": TALLY_URL,
-                    "company": context.company
-                }
-            }
-        )
+        return response_data
 
     except Exception as e:
         logger.exception("Chat processing failed")
@@ -955,29 +980,69 @@ def get_receivables(db: Session = Depends(get_db)):
 def get_dashboard_kpi(db: Session = Depends(get_db)):
     """
     Get Key Performance Indicators for the Dashboard.
-    - Total Sales (from Vouchers)
-    - Total Receivables (from Bills)
-    - Total Payables (from Bills)
-    - Cash in Hand (from Ledgers)
+    - Total Sales (This Month vs Last Month)
+    - Total Receivables (Current)
+    - Total Payables (Current)
+    - Cash in Hand (Current)
     """
     try:
-        # 1. Total Sales (Sum of Sales Vouchers)
-        # In a real app, filter by date range (e.g., this month)
-        sales_total = db.query(func.sum(Voucher.amount)).filter(Voucher.voucher_type == "Sales").scalar() or 0.0
+        now = datetime.now()
+        start_of_month = datetime(now.year, now.month, 1)
         
-        # 2. Receivables & Payables (from Bills)
+        # Calculate Last Month Start/End
+        if now.month == 1:
+            start_of_last_month = datetime(now.year - 1, 12, 1)
+            end_of_last_month = datetime(now.year - 1, 12, 31)
+        else:
+            start_of_last_month = datetime(now.year, now.month - 1, 1)
+            # Last day of last month is start_of_month - 1 day
+            end_of_last_month = start_of_month - timedelta(days=1)
+
+        # 1. Sales Logic
+        # This Month
+        sales_this_month = db.query(func.sum(Voucher.amount)).filter(
+            Voucher.voucher_type == "Sales",
+            Voucher.date >= start_of_month
+        ).scalar() or 0.0
+        
+        # Last Month
+        sales_last_month = db.query(func.sum(Voucher.amount)).filter(
+            Voucher.voucher_type == "Sales",
+            Voucher.date >= start_of_last_month,
+            Voucher.date <= end_of_last_month
+        ).scalar() or 0.0
+        
+        # Sales Change %
+        if sales_last_month == 0:
+            sales_change = 100.0 if sales_this_month > 0 else 0.0
+        else:
+            sales_change = ((sales_this_month - sales_last_month) / sales_last_month) * 100.0
+
+        # Total Sales (All Time or Year to Date? Usually Dashboard shows YTD or Monthly. Let's show Monthly for "Total Sales" context or All Time? 
+        # The UI says "Total Sales". Usually implies YTD. But for change %, we compare months.
+        # Let's return This Month's Sales as the main number for now, as that's more actionable.
+        # OR return Total YTD. Let's stick to Total YTD for the main number, but change is monthly? 
+        # Actually, let's make "Total Sales" be "This Month's Sales" to match the change metric. 
+        # User wants "math logic more correct". If I show Total All Time and say "12% from last month", that's confusing.
+        # Let's return This Month's Sales.
+        
+        # 2. Receivables & Payables (Snapshot)
+        # We don't have historical snapshots, so we can't calculate change accurately.
+        # Better to show 0% change than fake data.
         receivables = db.query(func.sum(Bill.amount)).filter(Bill.amount > 0).scalar() or 0.0
         payables = db.query(func.sum(Bill.amount)).filter(Bill.amount < 0).scalar() or 0.0
         
-        # 3. Cash in Hand (from Ledger)
-        # Assuming ledger name is "Cash"
+        # 3. Cash in Hand
         cash_ledger = db.query(Ledger).filter(Ledger.name == "Cash").first()
         cash_balance = cash_ledger.closing_balance if cash_ledger else 0.0
         
         return {
-            "sales": sales_total,
+            "sales": sales_this_month,
+            "sales_change": round(sales_change, 1),
             "receivables": receivables,
-            "payables": abs(payables), # Return positive number for display
+            "receivables_change": 0.0, # No historical data yet
+            "payables": abs(payables),
+            "payables_change": 0.0, # No historical data yet
             "cash": cash_balance,
             "last_updated": datetime.now().isoformat()
         }
@@ -1021,10 +1086,64 @@ class VoucherDraft(BaseModel):
     narration: Optional[str] = None
     items: Optional[List[Dict[str, Any]]] = []
 
+class LedgerDraft(BaseModel):
+    name: str
+    parent: str
+    opening_balance: float
+    gstin: Optional[str] = None
+    email: Optional[str] = None
+
+@app.post("/ledgers", dependencies=[Depends(get_api_key)])
+async def create_ledger_endpoint(ledger: LedgerDraft):
+    """
+    Create a new ledger in Tally via the Sync Engine.
+    """
+    # 1. Validate GSTIN if provided
+    if ledger.gstin:
+        validation = GSTEngine.validate_gstin(ledger.gstin)
+        if not validation["valid"]:
+            raise HTTPException(status_code=400, detail=f"Invalid GSTIN: {validation['error']}")
+
+    try:
+        # 2. Construct ledger data
+        ledger_data = ledger.dict()
+        
+        # 3. Push to Tally
+        result = sync_engine.tally.create_ledger(ledger_data)
+        
+        if result['status'] == "Success":
+            # 4. Save to Shadow DB
+            db = SessionLocal()
+            try:
+                new_ledger = Ledger(
+                    name=ledger.name,
+                    parent=ledger.parent,
+                    opening_balance=ledger.opening_balance,
+                    gstin=ledger.gstin,
+                    email=ledger.email,
+                    last_synced=datetime.now()
+                )
+                db.add(new_ledger)
+                db.commit()
+            except Exception as e:
+                logger.error(f"Shadow DB Error: {e}")
+                # Don't fail request if Tally succeeded
+            finally:
+                db.close()
+                
+            return {"status": "success", "message": "Ledger created successfully", "tally_response": result}
+        else:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Tally Rejected", "details": result})
+
+    except Exception as e:
+        logger.error(f"Failed to create ledger: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/vouchers", dependencies=[Depends(get_api_key)])
-async def create_voucher_endpoint(voucher: VoucherDraft):
+async def create_voucher_endpoint(voucher: VoucherDraft, db: Session = Depends(get_db)):
     """
     Create a voucher in Tally via the Sync Engine (Transactional).
+    Includes GST Tax Calculation.
     """
     try:
         # 1. Construct voucher data
@@ -1033,11 +1152,37 @@ async def create_voucher_endpoint(voucher: VoucherDraft):
             from datetime import datetime
             voucher_data['date'] = datetime.now().strftime("%Y%m%d")
 
-        # 2. Use Transactional Push
+        # 2. GST Calculation
+        # Fetch Party GSTIN from Shadow DB
+        party_ledger = db.query(Ledger).filter(Ledger.name == voucher.party_name).first()
+        party_gstin = party_ledger.gstin if party_ledger else None
+        
+        # Company GSTIN (Env or Default)
+        company_gstin = os.getenv("COMPANY_GSTIN", "27ABCDE1234F1Z5") # Default to Maharashtra
+        
+        if party_gstin and company_gstin:
+            tax_info = GSTEngine.calculate_tax(voucher.amount, party_gstin, company_gstin)
+            
+            # Append Tax Info to Narration
+            tax_str = f" [Tax: {tax_info['type']} ₹{tax_info['total_tax']} (IGST: {tax_info['igst']}, CGST: {tax_info['cgst']}, SGST: {tax_info['sgst']})]"
+            if voucher_data.get('narration'):
+                voucher_data['narration'] += tax_str
+            else:
+                voucher_data['narration'] = tax_str.strip()
+                
+            # Add tax info to response data (for frontend/debug)
+            voucher_data['tax_info'] = tax_info
+
+        # 3. Use Transactional Push
         result = sync_engine.push_voucher_safe(voucher_data)
         
         if result['success']:
-            return {"status": "success", "message": result['message'], "tally_response": result.get('tally_response')}
+            return {
+                "status": "success", 
+                "message": result['message'], 
+                "tally_response": result.get('tally_response'),
+                "tax_info": voucher_data.get('tax_info')
+            }
         else:
              return JSONResponse(status_code=400, content={"status": "error", "message": result['error'], "details": result.get('tally_response')})
 

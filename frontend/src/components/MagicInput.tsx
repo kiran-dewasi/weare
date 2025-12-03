@@ -12,16 +12,33 @@ interface DraftVoucher {
     party_name: string;
     voucher_type: string;
     amount: number;
-    items: { name: string; quantity: number; rate: number; amount: number }[];
+    items: { name: string; quantity: number; rate?: number; amount: number }[];
 }
 
-export default function MagicInput({ isFullPage = false, theme = "light" }: { isFullPage?: boolean, theme?: "light" | "dark" | "claude" }) {
+export default function MagicInput({
+    isFullPage = false,
+    theme = "light",
+    pageContext = {},
+    allowEmbedded = false,
+    suggestions = []
+}: {
+    isFullPage?: boolean,
+    theme?: "light" | "dark" | "claude",
+    pageContext?: any,
+    allowEmbedded?: boolean,
+    suggestions?: string[]
+}) {
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
-    const [draft, setDraft] = useState<DraftVoucher | null>(null);
-    const [response, setResponse] = useState<string | null>(null);
-    const [followUp, setFollowUp] = useState<{ question: string; missing_slots: string[] } | null>(null);
-    const [cardData, setCardData] = useState<any | null>(null);
+
+    // Chat History State
+    const [messages, setMessages] = useState<Array<{
+        role: 'user' | 'assistant',
+        content?: string,
+        type?: 'text' | 'draft_voucher' | 'follow_up' | 'card' | 'navigation',
+        data?: any
+    }>>([]);
+
     const router = useRouter();
     const searchParams = useSearchParams();
 
@@ -41,85 +58,107 @@ export default function MagicInput({ isFullPage = false, theme = "light" }: { is
         iconColor = "text-[#D96C46]";
         buttonClass = "absolute right-3 bottom-3 bg-[#D96C46] text-white hover:bg-[#C05A35] rounded-lg px-3 py-1.5 transition-all font-medium text-sm";
     } else {
-        // Linear/Vercel Style (Light)
         baseInputClass = "pl-12 h-16 text-lg bg-white border border-gray-200 text-gray-900 placeholder:text-gray-400 shadow-sm focus-visible:ring-2 focus-visible:ring-gray-900 focus-visible:border-transparent rounded-xl transition-all";
         iconColor = "text-gray-400";
         buttonClass = "absolute right-3 top-3 bottom-3 bg-gray-900 text-white hover:bg-gray-800 rounded-lg px-4 transition-all shadow-sm";
     }
 
-    // Auto-trigger if query param exists (only on full page)
+    // Auto-trigger if query param exists
     useEffect(() => {
         if (isFullPage) {
             const q = searchParams.get("q");
-            if (q && !input && !draft) {
-                setInput(q);
-                // Small delay to ensure state is set before triggering
-                setTimeout(() => handleMagic(q), 100);
+            if (q && messages.length === 0) {
+                // Add initial user message locally to show immediate feedback
+                setMessages([{ role: 'user', content: q }]);
+                handleMagic(q);
             }
         }
     }, [isFullPage, searchParams]);
+
+    // Scroll to bottom on new message
+    useEffect(() => {
+        if (messages.length > 0) {
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        }
+    }, [messages]);
 
     const handleMagic = async (overrideInput?: string) => {
         const textToProcess = overrideInput || input;
         if (!textToProcess.trim()) return;
 
-        // If on dashboard (not full page), redirect to chat page
-        if (!isFullPage) {
+        // If on dashboard (not full page) and not embedded, redirect to chat page
+        if (!isFullPage && !allowEmbedded) {
             router.push(`/chat?q=${encodeURIComponent(textToProcess)}`);
             return;
         }
 
+        // Add user message if not already added (overrideInput case handled in useEffect)
+        if (!overrideInput) {
+            setMessages(prev => [...prev, { role: 'user', content: textToProcess }]);
+        }
+
+        setInput("");
         setLoading(true);
+
         try {
-            const res = await fetch("http://127.0.0.1:8001/chat", {
+            // Find active draft from history if any
+            const lastDraftMsg = [...messages].reverse().find(m => m.type === 'draft_voucher');
+            const activeDraft = lastDraftMsg ? lastDraftMsg.data : null;
+
+            const res = await fetch("http://127.0.0.1:8001/api/v1/agent/chat", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                     "x-api-key": "k24-secret-key-123"
                 },
-                body: JSON.stringify({ message: textToProcess, user_id: "k24_user" }),
+                body: JSON.stringify({
+                    message: textToProcess,
+                    context: {
+                        ...pageContext,
+                        active_draft: activeDraft
+                    },
+                    auto_approve: false
+                }),
             });
             const data = await res.json();
 
-            // Handle different response types
-            if (data.type === "draft_voucher") {
-                setDraft(data.data);
-                setResponse(null);
-                setFollowUp(null);
-                setCardData(null);
-            } else if (data.type === "follow_up") {
-                setFollowUp({
-                    question: data.response,
-                    missing_slots: data.missing_slots || []
-                });
-                setResponse(null);
-                setDraft(null);
-                setCardData(null);
-            } else if (data.type === "card") {
-                setCardData(data);
-                setResponse(null);
-                setDraft(null);
-                setFollowUp(null);
-            } else {
-                // Text response
-                setResponse(data.response || data.message);
-                setDraft(null);
-                setFollowUp(null);
-                setCardData(null);
+            // Add assistant response
+            setMessages(prev => [...prev, {
+                role: 'assistant',
+                content: data.message || data.response, // Fallback for text
+                type: data.type,
+                data: data.data || data // Some endpoints might return data differently
+            }]);
+
+            // Handle Navigation
+            if (data.type === "navigation") {
+                setTimeout(() => {
+                    if (data.data?.path) {
+                        router.push(data.data.path);
+                    }
+                }, 2000);
             }
+
         } catch (err) {
             console.error("Magic failed:", err);
-            setResponse("⚠️ AI Brain is offline. Please check if the backend is running.");
+            setMessages(prev => [...prev, {
+                role: 'assistant',
+                content: "⚠️ AI Brain is offline. Please check if the backend is running.",
+                type: 'text'
+            }]);
         } finally {
             setLoading(false);
+            // Re-focus input
+            setTimeout(() => {
+                const textarea = document.querySelector('textarea');
+                if (textarea) textarea.focus();
+            }, 100);
         }
     };
 
-    const handleConfirm = async () => {
-        if (!draft) return;
-
+    const handleConfirmDraft = async (draft: DraftVoucher) => {
         try {
-            const res = await fetch("http://127.0.0.1:8001/vouchers", {
+            const res = await fetch("http://localhost:8001/vouchers", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -130,22 +169,133 @@ export default function MagicInput({ isFullPage = false, theme = "light" }: { is
             const result = await res.json();
 
             if (res.ok) {
-                alert(`Success! Voucher Created. \nRef: ${result.tally_response?.raw || "Synced"}`);
-                setDraft(null);
-                setInput("");
+                setMessages(prev => [...prev, {
+                    role: 'assistant',
+                    content: `Success! Voucher Created. Ref: ${result.tally_response?.raw || "Synced"}`,
+                    type: 'text'
+                }]);
                 // Trigger a refresh of the dashboard data
-                window.location.reload();
+                // window.location.reload(); // Don't reload, just show success
             } else {
                 alert(`Error: ${result.message}`);
             }
         } catch (err) {
-            console.error("Save failed:", err);
             alert("Failed to connect to backend.");
         }
     };
 
     return (
-        <div className="w-full max-w-2xl mx-auto mb-8">
+        <div className="w-full max-w-3xl mx-auto mb-8">
+
+            {/* Chat History */}
+            <div className="space-y-6 mb-8">
+                {messages.map((msg, idx) => (
+                    <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+
+                        {/* User Message */}
+                        {msg.role === 'user' && (
+                            <div className="bg-[#F4F4F0] text-[#1A1A1A] px-5 py-3 rounded-2xl rounded-tr-sm max-w-[80%] text-lg">
+                                {msg.content}
+                            </div>
+                        )}
+
+                        {/* Assistant Message */}
+                        {msg.role === 'assistant' && (
+                            <div className="w-full max-w-[90%] space-y-4">
+                                {/* Text Content */}
+                                {msg.content && (
+                                    <div className="flex gap-3">
+                                        <div className="mt-1 min-w-[24px]">
+                                            <Sparkles className="h-6 w-6 text-[#D96C46]" />
+                                        </div>
+                                        <div className="text-[#1A1A1A] text-lg leading-relaxed pt-0.5">
+                                            {msg.content}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Widgets / Cards */}
+                                <div className="pl-9">
+                                    {msg.type === 'draft_voucher' && msg.data && (
+                                        <Card className="border-purple-200 shadow-md bg-white">
+                                            <CardHeader className="bg-purple-50 pb-2">
+                                                <CardTitle className="text-purple-900 text-base flex justify-between items-center">
+                                                    <span>Confirm {msg.data.voucher_type}</span>
+                                                    <span className="text-xs font-normal text-purple-700 bg-purple-100 px-2 py-1 rounded-full">Draft</span>
+                                                </CardTitle>
+                                            </CardHeader>
+                                            <CardContent className="pt-4">
+                                                <div className="grid grid-cols-2 gap-4 mb-4">
+                                                    <div>
+                                                        <label className="text-xs text-muted-foreground uppercase font-bold">Party</label>
+                                                        <div className="text-base font-medium">{msg.data.party_name}</div>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <label className="text-xs text-muted-foreground uppercase font-bold">Amount</label>
+                                                        <div className="text-xl font-bold text-green-600">₹{msg.data.amount?.toLocaleString('en-IN')}</div>
+                                                    </div>
+                                                </div>
+                                                {msg.data.items && (
+                                                    <ul className="space-y-1 bg-gray-50 p-3 rounded-md">
+                                                        {msg.data.items.map((item: any, i: number) => (
+                                                            <li key={i} className="flex justify-between text-sm">
+                                                                <span>{item.name} <span className="text-muted-foreground">x {item.quantity}</span></span>
+                                                                <span>₹{(item.amount || 0).toLocaleString('en-IN')}</span>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                )}
+                                            </CardContent>
+                                            <CardFooter className="justify-end gap-2 pt-0 pb-4">
+                                                <Button onClick={() => handleConfirmDraft(msg.data)} className="bg-green-600 hover:bg-green-700 text-white">
+                                                    <Check className="mr-2 h-4 w-4" /> Approve & Save
+                                                </Button>
+                                            </CardFooter>
+                                        </Card>
+                                    )}
+
+                                    {msg.type === 'follow_up' && msg.data && (
+                                        <FollowUpCard
+                                            question={msg.data.question || msg.content}
+                                            missingSlots={msg.data.missing_slots}
+                                            onResponse={(answer) => handleMagic(answer)}
+                                        />
+                                    )}
+
+                                    {msg.type === 'card' && msg.data && (
+                                        <Card className="border-blue-200 shadow-md bg-blue-50/30">
+                                            <CardHeader className="pb-2">
+                                                <CardTitle className="text-blue-900 text-base">{msg.data.title || "Insight"}</CardTitle>
+                                            </CardHeader>
+                                            <CardContent>
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    {Object.entries(msg.data.data || {}).map(([key, value]) => (
+                                                        <div key={key} className="bg-white p-2 rounded border border-blue-100">
+                                                            <div className="text-[10px] text-muted-foreground uppercase font-bold">{key.replace(/_/g, ' ')}</div>
+                                                            <div className="text-base font-bold text-blue-700">{String(value)}</div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </CardContent>
+                                        </Card>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                ))}
+
+                {loading && (
+                    <div className="flex gap-3 animate-pulse">
+                        <div className="mt-1 min-w-[24px]">
+                            <Sparkles className="h-6 w-6 text-gray-300" />
+                        </div>
+                        <div className="h-4 w-24 bg-gray-200 rounded mt-2"></div>
+                    </div>
+                )}
+            </div>
+
+            {/* Input Area (Sticky Bottom or just at bottom of flow) */}
             <div className="relative">
                 {!isClaude && (
                     <div className={`absolute inset-y-0 left-4 flex items-center pointer-events-none ${isDark ? 'left-5' : 'left-3'}`}>
@@ -155,7 +305,7 @@ export default function MagicInput({ isFullPage = false, theme = "light" }: { is
 
                 {isClaude ? (
                     <textarea
-                        placeholder="How can I help you with your business today?"
+                        placeholder="Reply to KITTU..."
                         className={`${baseInputClass} w-full transition-all duration-300`}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
@@ -170,7 +320,7 @@ export default function MagicInput({ isFullPage = false, theme = "light" }: { is
                     />
                 ) : (
                     <Input
-                        placeholder="✨ Describe your transaction..."
+                        placeholder="✨ Type your message..."
                         className={`${baseInputClass} transition-all duration-300`}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
@@ -187,94 +337,33 @@ export default function MagicInput({ isFullPage = false, theme = "light" }: { is
                     {loading ? (
                         <span className="animate-pulse">...</span>
                     ) : (
-                        isClaude ? "Send Message" : <ArrowRight className="h-5 w-5" />
+                        isClaude ? "Send" : <ArrowRight className="h-5 w-5" />
                     )}
                 </Button>
             </div>
 
-            {/* Draft Confirmation Card */}
-            {draft && (
-                <Card className="mt-4 border-purple-200 shadow-xl animate-in fade-in slide-in-from-top-4">
-                    <CardHeader className="bg-purple-50 pb-2">
-                        <CardTitle className="text-purple-900 text-lg flex justify-between items-center">
-                            <span>Confirm {draft.voucher_type}?</span>
-                            <span className="text-sm font-normal text-purple-700 bg-purple-100 px-2 py-1 rounded-full">Draft</span>
-                        </CardTitle>
-                    </CardHeader>
-                    <CardContent className="pt-4">
-                        <div className="grid grid-cols-2 gap-4">
-                            <div>
-                                <label className="text-xs text-muted-foreground uppercase font-bold">Party</label>
-                                <div className="text-lg font-medium">{draft.party_name}</div>
-                            </div>
-                            <div className="text-right">
-                                <label className="text-xs text-muted-foreground uppercase font-bold">Total Amount</label>
-                                <div className="text-2xl font-bold text-green-600">₹{draft.amount.toLocaleString('en-IN')}</div>
-                            </div>
-                        </div>
-
-                        <div className="mt-4">
-                            <label className="text-xs text-muted-foreground uppercase font-bold">Items</label>
-                            <ul className="mt-1 space-y-1">
-                                {draft.items.map((item, idx) => (
-                                    <li key={idx} className="flex justify-between text-sm border-b border-dashed pb-1">
-                                        <span>{item.name} <span className="text-muted-foreground">x {item.quantity}</span></span>
-                                        <span>₹{item.amount.toLocaleString('en-IN')}</span>
-                                    </li>
-                                ))}
-                            </ul>
-                        </div>
-                    </CardContent>
-                    <CardFooter className="flex justify-end gap-2 bg-gray-50 pt-4">
-                        <Button variant="ghost" onClick={() => setDraft(null)} className="text-red-600 hover:text-red-700 hover:bg-red-50">
-                            <X className="mr-2 h-4 w-4" /> Cancel
-                        </Button>
-                        <Button onClick={handleConfirm} className="bg-green-600 hover:bg-green-700">
-                            <Check className="mr-2 h-4 w-4" /> Save to Tally
-                        </Button>
-                    </CardFooter>
-                </Card>
-            )}
-
-            {/* Follow-up Question Card */}
-            {followUp && (
-                <FollowUpCard
-                    question={followUp.question}
-                    missingSlots={followUp.missing_slots}
-                    onResponse={(answer) => {
-                        setFollowUp(null);
-                        handleMagic(answer);
-                    }}
-                />
-            )}
-
-            {/* AI Response Card */}
-            {response && (
-                <Card className="mt-4 border-[#E6E1D6] shadow-lg animate-in fade-in slide-in-from-top-4">
-                    <CardHeader className="bg-gradient-to-r from-[#F5F2EB] to-white pb-3">
-                        <CardTitle className="text-[#1A1A1A] text-lg flex items-center gap-2">
-                            <Sparkles className="h-5 w-5 text-[#D96C46]" />
-                            <span>KITTU</span>
-                        </CardTitle>
-                    </CardHeader>
-                    <CardContent className="pt-4">
-                        <div className="prose prose-sm max-w-none text-[#282828]">
-                            {response.split('\n').map((line, idx) => (
-                                <p key={idx} className="mb-2">{line}</p>
-                            ))}
-                        </div>
-                    </CardContent>
-                    <CardFooter className="bg-gray-50 justify-end">
-                        <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setResponse(null)}
-                            className="text-gray-600 hover:text-gray-900"
-                        >
-                            Clear
-                        </Button>
-                    </CardFooter>
-                </Card>
+            {/* Suggestions (Only if no messages) */}
+            {suggestions.length > 0 && messages.length === 0 && (
+                <div className="mt-8 pb-24">
+                    <div className="text-xs text-[#9B9B9B] mb-4 uppercase tracking-wider">
+                        Suggestions
+                    </div>
+                    <div className="space-y-2">
+                        {suggestions.map((suggestion, idx) => (
+                            <button
+                                key={idx}
+                                onClick={() => {
+                                    setInput(suggestion);
+                                    const textarea = document.querySelector('textarea');
+                                    if (textarea) textarea.focus();
+                                }}
+                                className="w-full text-left px-4 py-3 text-[14px] text-[#1A1A1A] bg-white hover:bg-[#F5F2EB] border border-[#E6E3DC] rounded-lg transition-colors"
+                            >
+                                {suggestion}
+                            </button>
+                        ))}
+                    </div>
+                </div>
             )}
         </div>
     );
