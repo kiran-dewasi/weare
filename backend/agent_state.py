@@ -58,6 +58,7 @@ class AgentState(TypedDict, total=False):
     
     # XML Generation
     generated_xml: Optional[str]
+    generated_answer: Optional[str]
     xml_validation_errors: List[str]
     xml_generation_attempts: int
     

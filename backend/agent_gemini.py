@@ -1,15 +1,16 @@
 # K24 AI Agent - Gemini XML Generator
 # ====================================
 # Uses Gemini to generate Tally-compliant XML for vouchers
+# Integrated with GeminiOrchestrator for robust handling
 
 from typing import Dict, Any, Optional, Tuple, List
 import logging
 import xml.etree.ElementTree as ET
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
 import os
 import re
 from datetime import datetime
+
+from backend.gemini.gemini_orchestrator import GeminiOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -25,21 +26,20 @@ class GeminiXMLAgent:
     Includes schema validation and retry logic.
     """
     
-    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash-exp"):
-        """Initialize with Gemini model optimized for XML generation"""
+    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash"):
+        """Initialize with Gemini Orchestrator"""
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY must be provided")
         
-        self.llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=self.api_key,
-            temperature=0.0,  # Zero temperature for deterministic output
-            max_tokens=2048
+        # Initialize orchestrator with XML-specific system prompt
+        self.orchestrator = GeminiOrchestrator(
+            api_key=self.api_key,
+            system_prompt="You are a Tally XML expert. Output ONLY valid XML."
         )
-        print(f"[AGENT] LangChain agent initialized with model: {model_name}")
+        print(f"[AGENT] GeminiXMLAgent initialized with model: {model_name}")
     
-    def generate_voucher_xml(
+    async def generate_voucher_xml(
         self,
         voucher_type: str,
         party_name: str,
@@ -68,12 +68,14 @@ class GeminiXMLAgent:
         )
         
         try:
-            # Generate XML
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            xml_text = response.content.strip()
+            # Generate XML using Orchestrator
+            # System prompt is already set in __init__
+            response_text = await self.orchestrator.invoke_with_retry(
+                query=prompt
+            )
             
             # Clean response
-            xml_text = self._clean_xml_response(xml_text)
+            xml_text = self._clean_xml_response(response_text)
             
             # Validate
             is_valid, errors = self._validate_xml(xml_text)
@@ -83,7 +85,10 @@ class GeminiXMLAgent:
                 return (True, xml_text, [])
             else:
                 logger.warning(f"Generated XML has validation errors: {errors}")
-                return (False, xml_text, errors)
+                
+                # Attempt to fix
+                logger.info("Attempting to fix XML...")
+                return await self.regenerate_with_fixes(xml_text, errors, prompt)
         
         except Exception as e:
             logger.error(f"XML generation failed: {e}")
@@ -103,7 +108,7 @@ class GeminiXMLAgent:
         # Get deposit account (Cash or Bank)
         deposit_to = additional_params.get("deposit_to", "Cash")
         tax_rate = additional_params.get("tax_rate", 0)
-        company_name = additional_params.get("company_name", "SHREE JI SALES")
+        company_name = additional_params.get("company_name", "Krishasales")
         
         # Calculate tax amount if applicable
         tax_amount = 0
@@ -293,7 +298,7 @@ Generate the complete XML now:"""
         is_valid = len(errors) == 0
         return (is_valid, errors)
     
-    def regenerate_with_fixes(
+    async def regenerate_with_fixes(
         self,
         original_xml: str,
         validation_errors: List[str],
@@ -317,9 +322,11 @@ Fix these errors and generate corrected XML. Remember:
 Generate the CORRECTED XML now (XML only, no explanations):"""
 
         try:
-            response = self.llm.invoke([HumanMessage(content=fix_prompt)])
-            xml_text = response.content.strip()
-            xml_text = self._clean_xml_response(xml_text)
+            response_text = await self.orchestrator.invoke_with_retry(
+                query=fix_prompt
+            )
+            
+            xml_text = self._clean_xml_response(response_text)
             
             is_valid, new_errors = self._validate_xml(xml_text)
             
@@ -328,26 +335,3 @@ Generate the CORRECTED XML now (XML only, no explanations):"""
         except Exception as e:
             logger.error(f"XML regeneration failed: {e}")
             return (False, "", [str(e)])
-
-
-# Example usage
-if __name__ == "__main__":
-    agent = GeminiXMLAgent()
-    
-    success, xml, errors = agent.generate_voucher_xml(
-        voucher_type="Receipt",
-        party_name="HDFC Bank",
-        amount=50000.00,
-        narration="Payment received for professional services",
-        additional_params={
-            "deposit_to": "Cash",
-            "company_name": "SHREE JI SALES"
-        }
-    )
-    
-    if success:
-        print("SUCCESS! Generated XML:")
-        print(xml)
-    else:
-        print(f"FAILED with errors: {errors}")
-        print(f"Partial XML:\n{xml}")

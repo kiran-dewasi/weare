@@ -9,18 +9,18 @@ import asyncio
 import logging
 import time
 from typing import Tuple, Optional, Dict, Any
-import google.generativeai as genai
 import os
 
 from backend.classification.intents import Intent
 from backend.classification.intent_patterns import pattern_match_intent
+from backend.gemini.gemini_orchestrator import GeminiOrchestrator
 
 logger = logging.getLogger(__name__)
 
 # Configuration
 DEFAULT_TIMEOUT = 3  # seconds
 CONFIDENCE_THRESHOLD = 0.85
-GEMINI_MODEL = "gemini-2.0-flash-exp"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 class IntentClassifier:
     """
@@ -30,96 +30,13 @@ class IntentClassifier:
     """
     
     def __init__(self, api_key: Optional[str] = None):
-        """Initialize classifier with Gemini API"""
+        """Initialize classifier with Gemini Orchestrator"""
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             logger.warning("GOOGLE_API_KEY not set. LLM classification will fail.")
-        else:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel(GEMINI_MODEL)
-    
-    async def classify_intent(
-        self,
-        message: str,
-        timeout: int = DEFAULT_TIMEOUT
-    ) -> Tuple[str, float, Dict[str, Any]]:
-        """
-        Classify user intent with timeout and confidence threshold.
-        
-        Flow:
-        1. Try pattern matching (fast path)
-        2. If no match or low confidence, try LLM
-        3. If timeout or low confidence, return CLARIFY_REQUEST
-        
-        Args:
-            message: User input message
-            timeout: Maximum time in seconds (default 3)
-            
-        Returns:
-            Tuple of (intent, confidence, metadata)
-            
-        Example:
-            >>> await classifier.classify_intent("Show me outstanding invoices")
-            ("QUERY_OUTSTANDING_INVOICES", 0.95, {"method": "pattern"})
-        """
-        start_time = time.time()
-        
-        try:
-            # Step 1: Fast pattern matching
-            intent, confidence = pattern_match_intent(message)
-            
-            if intent and confidence >= CONFIDENCE_THRESHOLD:
-                elapsed = time.time() - start_time
-                logger.info(f"Pattern match: {intent} (confidence={confidence:.2f}, time={elapsed*1000:.0f}ms)")
-                return (intent, confidence, {"method": "pattern", "elapsed": elapsed})
-            
-            # Step 2: LLM classification with timeout
-            try:
-                llm_intent, llm_confidence, llm_meta = await asyncio.wait_for(
-                    self._llm_classify(message),
-                    timeout=timeout
-                )
-                
-                elapsed = time.time() - start_time
-                
-                # Check confidence threshold
-                if llm_confidence >= CONFIDENCE_THRESHOLD:
-                    logger.info(f"LLM match: {llm_intent} (confidence={llm_confidence:.2f}, time={elapsed*1000:.0f}ms)")
-                    return (llm_intent, llm_confidence, {"method": "llm", "elapsed": elapsed})
-                else:
-                    # Low confidence, return clarification needed
-                    logger.info(f"Low confidence ({llm_confidence:.2f}), requesting clarification")
-                    return (Intent.CLARIFY_REQUEST, llm_confidence, {
-                        "method": "llm_low_confidence",
-                        "attempted": llm_intent,
-                        "elapsed": elapsed
-                    })
-                    
-            except asyncio.TimeoutError:
-                elapsed = time.time() - start_time
-                logger.warning(f"Classification timeout after {timeout}s")
-                return (Intent.CLARIFY_REQUEST, 0.0, {
-                    "method": "timeout",
-                    "elapsed": elapsed
-                })
-                
-        except Exception as e:
-            logger.error(f"Classification error: {e}")
-            return (Intent.UNKNOWN, 0.0, {"method": "error", "error": str(e)})
-    
-    async def _llm_classify(self, message: str) -> Tuple[str, float, Dict[str, Any]]:
-        """
-        Use Gemini LLM to classify intent.
-        
-        Args:
-            message: User input
-            
-        Returns:
-            Tuple of (intent, confidence, metadata)
-        """
         
         # Build comprehensive system prompt with all 68 intents
-        system_prompt = """You are KITTU, an expert AI accountant for K24.ai.
+        self.system_prompt = """You are KITTU, an expert AI accountant for K24.ai.
 
 Your task: Classify the user's intent into one of these accounting categories:
 
@@ -226,14 +143,105 @@ CONFIDENCE: 0.95
 CLARIFICATION: null
 """
         
-        prompt = f"{system_prompt}\n\nUser message: \"{message}\"\n\nYour classification:"
+        # Initialize orchestrator
+        self.orchestrator = GeminiOrchestrator(
+            api_key=self.api_key,
+            system_prompt=self.system_prompt
+        )
+    
+    async def classify_intent(
+        self,
+        message: str,
+        timeout: int = DEFAULT_TIMEOUT
+    ) -> Tuple[str, float, Dict[str, Any]]:
+        """
+        Classify user intent with timeout and confidence threshold.
         
-        # Call Gemini in thread to avoid blocking
-        def call_gemini():
-            response = self.model.generate_content(prompt)
-            return response.text
+        Flow:
+        1. Try pattern matching (fast path)
+        2. If no match or low confidence, try LLM
+        3. If timeout or low confidence, return CLARIFY_REQUEST
         
-        response_text = await asyncio.to_thread(call_gemini)
+        Args:
+            message: User input message
+            timeout: Maximum time in seconds (default 3)
+            
+        Returns:
+            Tuple of (intent, confidence, metadata)
+            
+        Example:
+            >>> await classifier.classify_intent("Show me outstanding invoices")
+            ("QUERY_OUTSTANDING_INVOICES", 0.95, {"method": "pattern"})
+        """
+        start_time = time.time()
+        
+        try:
+            # Step 1: Fast pattern matching
+            intent, confidence = pattern_match_intent(message)
+            
+            if intent and confidence >= CONFIDENCE_THRESHOLD:
+                elapsed = time.time() - start_time
+                logger.info(f"Pattern match: {intent} (confidence={confidence:.2f}, time={elapsed*1000:.0f}ms)")
+                return (intent, confidence, {"method": "pattern", "elapsed": elapsed})
+            
+            # Step 2: LLM classification with timeout
+            try:
+                llm_intent, llm_confidence, llm_meta = await asyncio.wait_for(
+                    self._llm_classify(message),
+                    timeout=timeout
+                )
+                
+                elapsed = time.time() - start_time
+                
+                # Check confidence threshold
+                if llm_confidence >= CONFIDENCE_THRESHOLD:
+                    logger.info(f"LLM match: {llm_intent} (confidence={llm_confidence:.2f}, time={elapsed*1000:.0f}ms)")
+                    return (llm_intent, llm_confidence, {"method": "llm", "elapsed": elapsed})
+                else:
+                    # Low confidence, return clarification needed
+                    logger.info(f"Low confidence ({llm_confidence:.2f}), requesting clarification")
+                    return (Intent.CLARIFY_REQUEST, llm_confidence, {
+                        "method": "llm_low_confidence",
+                        "attempted": llm_intent,
+                        "elapsed": elapsed
+                    })
+                    
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start_time
+                logger.warning(f"Classification timeout after {timeout}s")
+                return (Intent.CLARIFY_REQUEST, 0.0, {
+                    "method": "timeout",
+                    "elapsed": elapsed
+                })
+                
+        except Exception as e:
+            logger.error(f"Classification error: {e}")
+            return (Intent.UNKNOWN, 0.0, {"method": "error", "error": str(e)})
+    
+    async def _llm_classify(self, message: str) -> Tuple[str, float, Dict[str, Any]]:
+        """
+        Use Gemini LLM to classify intent.
+        
+        Args:
+            message: User input
+            
+        Returns:
+            Tuple of (intent, confidence, metadata)
+        """
+        
+        prompt = f"User message: \"{message}\"\n\nYour classification:"
+        
+        # Call Gemini via Orchestrator
+        # We use a short timeout for classification
+        try:
+            response_text = await self.orchestrator.invoke_with_retry(
+                query=prompt,
+                max_attempts=2,  # Fewer retries for latency sensitivity
+                timeout=5       # Short timeout
+            )
+        except Exception as e:
+            logger.error(f"LLM classification failed: {e}")
+            raise
         
         # Parse response
         intent, confidence, clarification = self._parse_llm_response(response_text)

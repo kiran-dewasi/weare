@@ -8,6 +8,8 @@ from datetime import datetime
 import re
 from backend.tally_connector import TallyConnector
 from backend.agent_errors import AgentError, K24ErrorCode, create_error
+from backend.compliance.india import validate_india
+from backend.compliance.india.india_validation_engine import ValidationResult as IndiaValidationResult
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +127,39 @@ class ValidatorAgent:
                 errors.extend(risk_result[0])
             if risk_result[1]:  # Has warnings
                 warnings.extend(risk_result[1])
+        
+        # Check 7: India Compliance Checks
+        try:
+            # Prepare context (In a real app, fetch this from DB/Config)
+            compliance_context = {
+                "annual_turnover": 45_00_000, # Placeholder
+                "business_type": "GOODS",
+                "state_code": "MH"
+            }
+            
+            india_result = validate_india(
+                parameters=validated_params,
+                intent=intent.upper(),
+                context=compliance_context
+            )
+            
+            # Map errors
+            for issue in india_result.errors:
+                errors.append(create_error(
+                    K24ErrorCode.BUSINESS_RULE_VIOLATION,
+                    message=issue.message,
+                    suggestions=[issue.action],
+                    context={"rule": issue.rule_name}
+                ))
+            
+            # Map warnings
+            for issue in india_result.warnings:
+                warnings.append(f"⚠️ {issue.message} ({issue.action})")
+                
+        except Exception as e:
+            logger.error(f"India compliance check failed: {e}")
+            # Don't fail validation if compliance check fails internally, just log it
+
         
         # Calculate confidence score
         confidence = 1.0 - (len(warnings) * 0.1)

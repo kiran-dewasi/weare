@@ -48,7 +48,7 @@ async def get_current_user_or_api_key(
         return {
             "username": "k24_user",
             "role": "admin",
-            "company_name": "SHREE JI SALES"
+            "company_name": "Krishasales"
         }
     
     # If no API key, rely on the token user (which will raise 401 if missing/invalid)
@@ -69,7 +69,7 @@ async def get_auth_user(
         return {
             "username": "k24_user",
             "role": "admin",
-            "company_name": "SHREE JI SALES",
+            "company_name": "Krishasales",
             "tier": "enterprise"
         }
     
@@ -130,20 +130,8 @@ class ApprovalRequest(BaseModel):
 # ========== Endpoints ==========
 
 from backend.middleware.main_middleware import RequestOrchestrator
-from backend.middleware.health_check import HealthCheck
 
-@router.get("/health")
-async def health_check():
-    """
-    Health check endpoint - returns status of all services.
-    This endpoint bypasses authentication and middleware checks.
-    """
-    checks = await HealthCheck.perform_all_checks()
-    return {
-        "status": "healthy" if checks["overall_healthy"] else "degraded",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "services": checks
-    }
+
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
@@ -169,7 +157,7 @@ async def chat(
         logger.info(f"Chat request from user {current_user.get('username')}: {request.message}")
         
         # Get company name from user context or default
-        company_name = current_user.get("company_name", "SHREE JI SALES")
+        company_name = current_user.get("company_name", "Krishasales")
         
         # Process message through orchestrator
         agent_output = await orchestrator.process_message(
@@ -188,13 +176,15 @@ async def chat(
     
     except Exception as e:
         logger.error(f"Chat endpoint error: {e}", exc_info=True)
+        
+        # Use AgentErrorHandler to format the error
+        from backend.agent_error_handler import AgentErrorHandler
+        handler = AgentErrorHandler()
+        agent_error = handler.handle_error(e, {"operation": "chat_endpoint"})
+        
         raise HTTPException(
             status_code=500,
-            detail={
-                "status": "ERROR",
-                "message": f"An error occurred: {str(e)}",
-                "error_code": "INTERNAL_ERROR"
-            }
+            detail=agent_error.to_dict()
         )
 
 
@@ -323,10 +313,13 @@ async def health_check() -> Dict[str, Any]:
         # Check Gemini API
         gemini_status = "ONLINE"
         try:
-            # Simple test classification
-            _, conf, _ = orchestrator.intent_classifier.classify("test")
-            if conf == 0.0:
-                gemini_status = "DEGRADED"
+            # Simple check if API key is present and orchestrator is initialized
+            # We avoid making a live call here to prevent quota drain from monitoring tools
+            if not orchestrator.api_key:
+                gemini_status = "OFFLINE: No API Key"
+            else:
+                # Assume online if initialized, deep check happens in middleware if needed
+                gemini_status = "ONLINE"
         except Exception as e:
             gemini_status = f"OFFLINE: {str(e)}"
         

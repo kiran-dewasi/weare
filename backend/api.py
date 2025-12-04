@@ -65,12 +65,25 @@ app.include_router(compliance.router)
 # Global simulated in-memory dataframe (single-user MVP)
 dataframe = None
 DATA_LOG_PATH = "data_log.pkl"
-TALLY_COMPANY = os.getenv("TALLY_COMPANY", "SHREE JI SALES")
+TALLY_COMPANY = os.getenv("TALLY_COMPANY", "Krishasales")
 TALLY_URL = os.getenv("TALLY_URL", "http://localhost:9000")
 LIVE_SYNC = bool(os.getenv("TALLY_LIVE_SYNC", ""))
 # Safety flag for live Tally updates - set to "true" to enable actual sync to Tally
 TALLY_LIVE_UPDATE_ENABLED = os.getenv("TALLY_LIVE_UPDATE_ENABLED", "true").lower() == "true"
-print(f"🚀 TALLY LIVE UPDATE ENABLED: {TALLY_LIVE_UPDATE_ENABLED}")
+print(f"[INFO] TALLY LIVE UPDATE ENABLED: {TALLY_LIVE_UPDATE_ENABLED}")
+
+# Load Config from JSON (Overrides env vars)
+import json
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if os.path.exists("k24_config.json"):
+    try:
+        with open("k24_config.json", "r") as f:
+            config = json.load(f)
+            GOOGLE_API_KEY = config.get("google_api_key", GOOGLE_API_KEY)
+            TALLY_COMPANY = config.get("company_name", TALLY_COMPANY)
+            TALLY_URL = config.get("tally_url", TALLY_URL)
+    except:
+        pass
 
 # Initialize Tally Connector
 tally = TallyConnector(url=TALLY_URL, company_name=TALLY_COMPANY)
@@ -86,16 +99,6 @@ from backend.orchestration.follow_up_manager import FollowUpManager
 from backend.sync.sync_monitor import monitor as sync_monitor
 
 # Initialize Orchestrator
-import json
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if os.path.exists("k24_config.json"):
-    try:
-        with open("k24_config.json", "r") as f:
-            config = json.load(f)
-            GOOGLE_API_KEY = config.get("google_api_key", GOOGLE_API_KEY)
-    except:
-        pass
-
 orchestrator = None
 if GOOGLE_API_KEY:
     try:
@@ -148,9 +151,9 @@ async def startup_event():
     # Initialize AI Agent Orchestrator
     try:
         agent.init_orchestrator()
-        logger.info("✅ AI Agent orchestrator initialized")
+        logger.info("[SUCCESS] AI Agent orchestrator initialized")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize AI Agent: {e}")
+        logger.error(f"[ERROR] Failed to initialize AI Agent: {e}")
 
 def checkpoint(df):
     crud.log_change(df, DATA_LOG_PATH)

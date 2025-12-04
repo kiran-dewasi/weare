@@ -326,6 +326,7 @@ export default function MagicInput({
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && handleMagic()}
                         disabled={loading}
+                        suppressHydrationWarning
                     />
                 )}
 

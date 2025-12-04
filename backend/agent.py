@@ -18,7 +18,7 @@ class TallyAgent:
         """
         # Resolve model name: parameter > env > default
         if model_name is None:
-            model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
         # Get API key from parameter or environment variable
         if api_key is None:

@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tally_connector")
 
 TALLY_API_URL = os.getenv("TALLY_URL", "http://localhost:9000")
-DEFAULT_COMPANY = os.getenv("TALLY_COMPANY", "SHREE JI SALES")
+DEFAULT_COMPANY = os.getenv("TALLY_COMPANY", "Krishasales")
 
 # Try loading from config file
 try:
@@ -370,7 +370,7 @@ class TallyConnector:
           - rate: float
           - amount: float
         """
-        cname = self.company_name or "SHREE JI SALES" # Fallback
+        cname = self.company_name or "Krishasales" # Fallback
         
         # AUTO-CREATE LEDGERS IF MISSING
         party_name = voucher_data.get("party_name")

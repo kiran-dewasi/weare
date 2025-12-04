@@ -106,6 +106,7 @@ class Intent(str, Enum):
     # FALLBACK (2 intents)
     CLARIFY_REQUEST = "CLARIFY_REQUEST"
     UNKNOWN = "UNKNOWN"
+    GREETING = "GREETING"
 
 # Intent to category mapping
 INTENT_TO_CATEGORY: Dict[str, IntentCategory] = {
@@ -194,6 +195,7 @@ INTENT_TO_CATEGORY: Dict[str, IntentCategory] = {
     # FALLBACK
     Intent.CLARIFY_REQUEST: IntentCategory.FALLBACK,
     Intent.UNKNOWN: IntentCategory.FALLBACK,
+    Intent.GREETING: IntentCategory.META_OPERATIONS,
 }
 
 # Intent descriptions

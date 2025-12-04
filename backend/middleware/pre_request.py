@@ -83,15 +83,19 @@ class HealthCheck:
             
         try:
             genai.configure(api_key=api_key)
-            # Lightweight check: list models
-            # We run this in a thread to avoid blocking async loop
-            def check_first_model():
-                # Just try to get one model to verify auth/connectivity
-                for _ in genai.list_models():
-                    return True
-                return True # If no models but no error, auth is likely fine
             
-            await asyncio.to_thread(check_first_model)
+            # Lightweight check: Count tokens instead of generating content
+            def check_models():
+                try:
+                    model = genai.GenerativeModel("gemini-2.0-flash")
+                    model.count_tokens("test")
+                    return True
+                except Exception as e:
+                    if "429" in str(e) or "Resource has been exhausted" in str(e):
+                        return True
+                    raise e
+            
+            await asyncio.to_thread(check_models)
             return True
         except Exception as e:
             logger.error(f"GEMINI_AUTH_FAILED: {e}")

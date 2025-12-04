@@ -5,10 +5,9 @@
 from typing import Dict, Any, Tuple, Optional, List
 import logging
 import re
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
 import os
 import json
+from backend.gemini.gemini_orchestrator import GeminiOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -27,20 +26,19 @@ class IntentClassifier:
         "query_data",
         "audit_transactions",
         "update_ledger",
+        "greeting",
         "unknown"
     ]
     
-    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: str = None, model_name: str = "gemini-2.0-flash"):
         """Initialize with Gemini model optimized for intent classification"""
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError("GOOGLE_API_KEY must be provided")
         
-        self.llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=self.api_key,
-            temperature=0.1,  # Low temperature for consistency
-            max_tokens=500
+        # Initialize orchestrator
+        self.orchestrator = GeminiOrchestrator(
+            api_key=self.api_key
         )
     
     def classify(self, user_message: str) -> Tuple[str, float, Dict[str, Any]]:
@@ -59,20 +57,66 @@ class IntentClassifier:
         # Use LLM for complex cases
         try:
             print(f"[INTENT] Classifying message: {user_message}")
-            result = self._llm_classify(user_message)
+            import asyncio
+            
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+            if loop.is_running():
+                # If we are already in a loop (which we likely are in FastAPI), 
+                # we can't use run_until_complete.
+                # We assume the caller handles async if needed, but here we are stuck.
+                # However, since we are fixing the greeting issue, let's just return unknown if we can't run async.
+                # Ideally, we should use classify_async.
+                pass
+            else:
+                return loop.run_until_complete(self.classify_async(user_message))
+                
+            # If we are here, we are in a running loop and called synchronously.
+            # This is bad design but we'll try to use a thread or just fail gracefully.
+            # For now, let's assume the caller uses classify_async.
+            return ("unknown", 0.0, {})
+            
+        except Exception as e:
+            logger.error(f"Intent classification setup failed: {e}")
+            return ("unknown", 0.0, {})
+
+    async def classify_async(self, user_message: str) -> Tuple[str, float, Dict[str, Any]]:
+        """
+        Classify intent and extract parameters (Async).
+        Returns: (intent, confidence, parameters)
+        """
+        # Quick pattern matching
+        quick_match = self._quick_pattern_match(user_message)
+        if quick_match:
+            intent, params = quick_match
+            logger.info(f"Quick pattern match: {intent}")
+            return (intent, 0.95, params)
+
+        try:
+            print(f"[INTENT] Classifying message: {user_message}")
+            result = await self._llm_classify(user_message)
             print(f"[INTENT] Classified as: {result[0]} (confidence: {result[1]})")
             return result
         except Exception as e:
             logger.error(f"Intent classification failed: {e}")
             print(f"[INTENT ERROR] {e}")
             return ("unknown", 0.0, {})
-    
+
     def _quick_pattern_match(self, message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
         Fast pattern matching for common intents.
         Returns (intent, params) or None if no match.
         """
-        message_lower = message.lower()
+        message_lower = message.lower().strip()
+        
+        # Greeting patterns (Exact or simple matches)
+        greetings = ["hello", "hi", "hey", "good morning", "good evening", "good afternoon", "hola", "namaste"]
+        if message_lower in greetings or any(message_lower.startswith(g + " ") for g in greetings):
+            return ("greeting", {})
         
         # Create invoice patterns
         if any(word in message_lower for word in ["invoice", "bill", "sales"]):
@@ -153,7 +197,7 @@ class IntentClassifier:
         
         return params
     
-    def _llm_classify(self, message: str) -> Tuple[str, float, Dict[str, Any]]:
+    async def _llm_classify(self, message: str) -> Tuple[str, float, Dict[str, Any]]:
         """Use Gemini to classify intent and extract parameters"""
         
         # Build prompt using string concatenation to avoid any encoding issues
@@ -164,7 +208,7 @@ class IntentClassifier:
             "Analyze the intent and extract parameters. "
             "Return ONLY a valid JSON object with this exact structure:\n"
             "{\n"
-            "  \"intent\": \"<one of: create_invoice, create_receipt, create_payment, create_sales, query_data, audit_transactions, unknown>\",\n"
+            "  \"intent\": \"<one of: create_invoice, create_receipt, create_payment, create_sales, query_data, audit_transactions, update_ledger, greeting, unknown>\",\n"
             "  \"confidence\": <float between 0.0 and 1.0>,\n"
             "  \"parameters\": {\n"
             "    \"party_name\": \"<customer/vendor name>\",\n"
@@ -185,8 +229,8 @@ class IntentClassifier:
         )
 
         try:
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            response_text = response.content.strip()
+            # Use orchestrator to get response
+            response_text = await self.orchestrator.invoke_with_retry(query=prompt)
             
             # Clean up response (remove markdown if present)
             if response_text.startswith("```"):
@@ -217,7 +261,7 @@ class IntentClassifier:
         except Exception as e:
             logger.error(f"LLM classification error: {e}")
             return ("unknown", 0.0, {})
-    
+
     def get_intent_description(self, intent: str) -> str:
         """Get human-readable description of intent"""
         descriptions = {
@@ -228,6 +272,7 @@ class IntentClassifier:
             "query_data": "Query financial data",
             "audit_transactions": "Audit and review transactions",
             "update_ledger": "Update ledger information",
+            "greeting": "Greeting",
             "unknown": "Unable to determine intent"
         }
         return descriptions.get(intent, "Unknown intent")

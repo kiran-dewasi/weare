@@ -141,6 +141,7 @@ export default function Navbar() {
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             onKeyDown={handleSearch}
+                            suppressHydrationWarning
                         />
                     </div>
                     <div className="flex items-center gap-2 mr-2">

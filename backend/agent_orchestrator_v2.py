@@ -20,6 +20,8 @@ from backend.agent_error_handler import AgentErrorHandler, FallbackStrategies, r
 from backend.agent_transaction import TransactionManager
 from backend.agent_errors import K24ErrorCode, create_error
 from backend.tally_connector import TallyConnector
+from backend.classification.intents import IntentCategory, INTENT_TO_CATEGORY, Intent
+from backend.gemini.gemini_orchestrator import GeminiOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ class K24AgentOrchestrator:
         self,
         api_key: str = None,
         tally_url: str = "http://localhost:9000",
-        company_name: str = "SHREE JI SALES",
+        company_name: str = "Krishasales",
         tally_edu_mode: bool = True
     ):
         """Initialize all agent components"""
@@ -51,6 +53,9 @@ class K24AgentOrchestrator:
         self.xml_generator = GeminiXMLAgent(api_key=self.api_key)
         self.error_handler = AgentErrorHandler()
         self.transaction_manager = TransactionManager(tally_connector=self.tally)
+        
+        # Initialize Gemini Orchestrator for general queries (KITTU)
+        self.gemini_orchestrator = GeminiOrchestrator(api_key=self.api_key)
         
         # Configuration
         self.company_name = company_name
@@ -70,6 +75,7 @@ class K24AgentOrchestrator:
         workflow.add_node("parse_intent", self._parse_intent_node)
         workflow.add_node("validate_params", self._validate_params_node)
         workflow.add_node("generate_xml", self._generate_xml_node)
+        workflow.add_node("generate_answer", self._generate_answer_node)  # New node for KITTU
         workflow.add_node("create_preview", self._create_preview_node)
         workflow.add_node("execute_transaction", self._execute_transaction_node)
         workflow.add_node("verify_transaction", self._verify_transaction_node)
@@ -85,6 +91,7 @@ class K24AgentOrchestrator:
             self._should_proceed_after_intent,
             {
                 "validate": "validate_params",
+                "answer": "generate_answer",
                 "error": "handle_error"
             }
         )
@@ -108,6 +115,7 @@ class K24AgentOrchestrator:
             }
         )
         
+        workflow.add_edge("generate_answer", "build_response")
         workflow.add_edge("create_preview", "build_response")  # Preview → Response (wait for approval)
         workflow.add_edge("execute_transaction", "verify_transaction")
         workflow.add_edge("verify_transaction", "build_response")
@@ -177,13 +185,13 @@ class K24AgentOrchestrator:
 
     # ========== Node Functions ==========
     
-    def _parse_intent_node(self, state: AgentState) -> AgentState:
+    async def _parse_intent_node(self, state: AgentState) -> AgentState:
         """Node 1: Parse user intent"""
         
         logger.info(f"[{state['transaction_id']}] Parsing intent")
         
         try:
-            intent, confidence, params = self.intent_classifier.classify(state["user_message"])
+            intent, confidence, params = await self.intent_classifier.classify_async(state["user_message"])
             
             # Normalize party name
             if "party_name" in params:
@@ -199,18 +207,17 @@ class K24AgentOrchestrator:
             if "voucher_type" not in params and intent in voucher_type_map:
                 params["voucher_type"] = voucher_type_map[intent]
             
-            # Handle unknown intent explicitly
-            if intent == "unknown":
-                return self._add_error_to_state(
-                    state,
-                    K24ErrorCode.UNKNOWN_INTENT,
-                    "I didn't understand that command. Try something like 'Create invoice for HDFC' or 'Show outstanding bills'."
-                )
+            # Determine category
+            category = INTENT_TO_CATEGORY.get(intent, IntentCategory.FALLBACK)
+            
+            # Handle unknown/fallback by routing to KITTU (generate_answer)
+            # We don't error out immediately anymore
             
             return update_state_with_audit(
                 state,
                 {
                     "intent": intent,
+                    "intent_category": category,
                     "intent_confidence": confidence,
                     "raw_parameters": params,
                     "status": TransactionStatus.VALIDATING
@@ -269,7 +276,7 @@ class K24AgentOrchestrator:
                 f"Validation exception: {str(e)}"
             )
     
-    def _generate_xml_node(self, state: AgentState) -> AgentState:
+    async def _generate_xml_node(self, state: AgentState) -> AgentState:
         """Node 3: Generate Tally XML"""
         
         logger.info(f"[{state['transaction_id']}] Generating XML")
@@ -277,8 +284,8 @@ class K24AgentOrchestrator:
         try:
             params = state["validated_parameters"]
             
-            # Generate XML
-            success, xml, errors = self.xml_generator.generate_voucher_xml(
+            # Generate XML (now async)
+            success, xml, errors = await self.xml_generator.generate_voucher_xml(
                 voucher_type=params.get("voucher_type", "Receipt"),
                 party_name=params.get("party_name", ""),
                 amount=params.get("amount", 0),
@@ -320,6 +327,39 @@ class K24AgentOrchestrator:
                 state,
                 K24ErrorCode.XML_VALIDATION_FAILED,
                 f"XML generation failed: {str(e)}"
+            )
+    
+    async def _generate_answer_node(self, state: AgentState) -> AgentState:
+        """Node 3b: Generate Answer for General Queries (KITTU)"""
+        
+        logger.info(f"[{state['transaction_id']}] Generating Answer via KITTU")
+        
+        try:
+            # Invoke Gemini with KITTU persona
+            # We inject context into the query since invoke_with_retry doesn't support context param
+            
+            context_str = f"Context: Company={state['company_name']}, Intent={state['intent']}"
+            full_query = f"{context_str}\n\nUser Query: {state['user_message']}"
+            
+            response_text = await self.gemini_orchestrator.invoke_with_retry(
+                query=full_query
+            )
+            
+            return update_state_with_audit(
+                state,
+                {
+                    "generated_answer": response_text,
+                    "status": TransactionStatus.SUCCESS
+                },
+                "Answer generated via KITTU"
+            )
+            
+        except Exception as e:
+            logger.error(f"KITTU generation error: {e}")
+            return self._add_error_to_state(
+                state,
+                K24ErrorCode.UNKNOWN_ERROR,
+                f"Failed to generate answer: {str(e)}"
             )
     
     def _create_preview_node(self, state: AgentState) -> AgentState:
@@ -423,11 +463,29 @@ class K24AgentOrchestrator:
             status_value = status
         
         # Calculate duration
-        started_at = datetime.fromisoformat(state["started_at"].replace("Z", "+00:00"))
-        completed_at = datetime.utcnow()
-        duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+        try:
+            from datetime import timezone
+            # Ensure both are offset-aware
+            if "Z" in state["started_at"]:
+                started_at = datetime.fromisoformat(state["started_at"].replace("Z", "+00:00"))
+            else:
+                started_at = datetime.fromisoformat(state["started_at"]).replace(tzinfo=timezone.utc)
+                
+            completed_at = datetime.now(timezone.utc)
+            duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+        except Exception as e:
+            logger.error(f"Error calculating duration: {e}")
+            duration_ms = 0
         
-        if state.get("requires_approval") and not state.get("approved"):
+        if state.get("generated_answer"):
+            # General Answer (KITTU)
+            response = {
+                "status": "SUCCESS",
+                "transaction_id": state["transaction_id"],
+                "message": state["generated_answer"],
+                "type": "answer"
+            }
+        elif state.get("requires_approval") and not state.get("approved"):
             # Awaiting approval
             response = {
                 "status": "AWAITING_APPROVAL",
@@ -435,9 +493,10 @@ class K24AgentOrchestrator:
                 "message": "Please review and approve this transaction",
                 "preview": state.get("transaction_preview"),
                 "risk_level": state.get("risk_level"),
-                "warnings": state.get("validation_warnings", [])
+                "warnings": state.get("validation_warnings", []),
+                "type": "transaction_preview"
             }
-        elif status_value == "SUCCESS":
+        elif str(status_value).upper() == "SUCCESS":
             # Success
             response = {
                 "status": "SUCCESS",
@@ -453,15 +512,21 @@ class K24AgentOrchestrator:
                     "created_by": state["user_id"],
                     "timestamp": state.get("execution_timestamp"),
                     "duration_ms": duration_ms
-                }
+                },
+                "type": "transaction_success"
             }
         else:
             # Error
+            # Use the first error message if available
+            errors = state.get("errors", [])
+            error_msg = errors[0].get("message") if errors else "Transaction failed. See errors for details."
+            
             response = {
                 "status": "FAILED",
                 "transaction_id": state["transaction_id"],
-                "errors": state.get("errors", []),
-                "message": "Transaction failed. See errors for details."
+                "errors": errors,
+                "message": error_msg,
+                "type": "error"
             }
         
         return update_state_with_audit(
@@ -505,9 +570,13 @@ class K24AgentOrchestrator:
     
     def _should_proceed_after_intent(self, state: AgentState) -> str:
         """Decide next step after intent parsing"""
-        if state.get("intent") and state.get("intent") != "unknown":
+        category = state.get("intent_category")
+        
+        if category == IntentCategory.CREATE_OPERATIONS:
             return "validate"
-        return "error"
+        else:
+            # For all other categories (Queries, Compliance, Unknown), route to KITTU
+            return "answer"
     
     def _should_proceed_after_validation(self, state: AgentState) -> str:
         """Decide next step after validation"""

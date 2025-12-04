@@ -47,11 +47,24 @@ class RetryConfig:
             "wait_max": 8,
             "fallback": "use_template"
         },
-        K24ErrorCode.TALLY_CONNECTION_FAILED: {
-            "max_attempts": 2,
-            "wait_strategy": "fixed",
-            "wait_seconds": 3,
+        K24ErrorCode.GEMINI_API_RATE_LIMIT: {
+            "max_attempts": 5,
+            "wait_strategy": "exponential",
+            "wait_multiplier": 2,
+            "wait_max": 30,
             "fallback": "queue_for_later"
+        },
+        K24ErrorCode.TALLY_CONNECTION_FAILED: {
+            "max_attempts": 3,
+            "wait_strategy": "fixed",
+            "wait_seconds": 5,
+            "fallback": "queue_for_later"
+        },
+        K24ErrorCode.DATABASE_CONNECTION_FAILED: {
+            "max_attempts": 3,
+            "wait_strategy": "fixed",
+            "wait_seconds": 2,
+            "fallback": "read_only_mode"
         },
         K24ErrorCode.XML_VALIDATION_FAILED: {
             "max_attempts": 2,
@@ -62,6 +75,11 @@ class RetryConfig:
             "max_attempts": 1,
             "wait_strategy": "none",
             "fallback": "suggest_alternatives"
+        },
+        K24ErrorCode.INVALID_AMOUNT: {
+            "max_attempts": 1,
+            "wait_strategy": "none",
+            "fallback": "ask_correction"
         },
     }
     
@@ -133,60 +151,175 @@ class AgentErrorHandler:
         error_type = type(error).__name__
         error_message = str(error).lower()
         
-        # Gemini API errors
+        # --- SYSTEM ERRORS ---
         if "timeout" in error_message or "timed out" in error_message:
             return K24ErrorCode.GEMINI_API_TIMEOUT
-        
-        if any(word in error_message for word in ["api", "gemini", "rate limit"]):
-            return K24ErrorCode.GEMINI_API_ERROR
-        
-        # Tally errors
+            
+        if "rate limit" in error_message or "429" in error_message:
+            return K24ErrorCode.GEMINI_API_RATE_LIMIT
+            
+        if any(word in error_message for word in ["auth", "permission", "401", "403", "key"]):
+            if "gemini" in error_message or "api" in error_message:
+                return K24ErrorCode.GEMINI_API_AUTH_FAILED
+            return K24ErrorCode.UNAUTHORIZED_ACCESS
+            
+        if any(word in error_message for word in ["database", "sqlalchemy", "db connection"]):
+            return K24ErrorCode.DATABASE_CONNECTION_FAILED
+            
+        if "redis" in error_message:
+            return K24ErrorCode.REDIS_CONNECTION_FAILED
+            
         if any(word in error_message for word in ["tally", "connection", "localhost:9000"]):
             return K24ErrorCode.TALLY_CONNECTION_FAILED
-        
-        # XML errors
-        if any(word in error_message for word in ["xml", "parse", "malformed"]):
-            return K24ErrorCode.XML_VALIDATION_FAILED
-        
-        # Ledger errors
+            
+        # --- VALIDATION ERRORS ---
         if "ledger" in error_message and "not found" in error_message:
             return K24ErrorCode.LEDGER_NOT_FOUND
+            
+        if "amount" in error_message:
+            if "invalid" in error_message or "negative" in error_message:
+                return K24ErrorCode.INVALID_AMOUNT
+            if "large" in error_message:
+                return K24ErrorCode.AMOUNT_SUSPICIOUSLY_LARGE
+                
+        if "date" in error_message:
+            return K24ErrorCode.INVALID_DATE
+            
+        if "gst" in error_message and "rate" in error_message:
+            return K24ErrorCode.INVALID_GST_RATE
+            
+        if "gstin" in error_message:
+            return K24ErrorCode.INVALID_GSTIN_FORMAT
+            
+        # --- FINANCIAL ERRORS ---
+        if "duplicate" in error_message:
+            return K24ErrorCode.DUPLICATE_INVOICE_DETECTED
+            
+        if "credit limit" in error_message:
+            return K24ErrorCode.CREDIT_LIMIT_EXCEEDED
+            
+        if "reverse charge" in error_message:
+            return K24ErrorCode.REVERSE_CHARGE_APPLICABLE
+            
+        if "tds" in error_message:
+            return K24ErrorCode.TDS_OBLIGATION
+            
+        # --- GENERIC FALLBACKS ---
+        if any(word in error_message for word in ["xml", "parse", "malformed"]):
+            return K24ErrorCode.XML_VALIDATION_FAILED
+            
+        if any(word in error_message for word in ["api", "gemini"]):
+            return K24ErrorCode.GEMINI_API_ERROR
         
-        # Default
         return K24ErrorCode.UNKNOWN_ERROR
     
     def _get_error_suggestions(self, error_code: K24ErrorCode, context: Dict[str, Any]) -> List[str]:
         """Get actionable suggestions for an error"""
         
         suggestions_map = {
-            K24ErrorCode.GEMINI_API_TIMEOUT: [
-                "The AI is taking longer than expected. Retrying automatically...",
-                "If this persists, try again in a few minutes"
-            ],
-            K24ErrorCode.GEMINI_API_ERROR: [
-                "There's a temporary issue with the AI service",
-                "Retrying with fallback method..."
+            # --- SYSTEM ---
+            K24ErrorCode.DATABASE_CONNECTION_FAILED: [
+                "Database is temporarily unavailable. Please wait a moment.",
+                "Retry after 60 seconds",
+                "Contact support if issue persists"
             ],
             K24ErrorCode.TALLY_CONNECTION_FAILED: [
-                "Make sure Tally is running",
-                "Check that Tally is on port 9000",
-                "Verify network connection to Tally",
-                "Try restarting Tally"
+                "Can't reach your Tally. Check your ODBC connection.",
+                "Verify Tally is running on port 9000",
+                "Ensure Tally company is open"
             ],
-            K24ErrorCode.XML_VALIDATION_FAILED: [
-                "The transaction data couldn't be formatted correctly",
-                "Try rephrasing your request",
-                "Use the manual form instead"
+            K24ErrorCode.GEMINI_API_TIMEOUT: [
+                "AI agent is thinking too long. Let's try again?",
+                "Retrying automatically...",
+                "If this persists, try rephrasing your request"
             ],
+            K24ErrorCode.GEMINI_API_RATE_LIMIT: [
+                "Too many AI requests right now. Wait a moment?",
+                "We've queued your request for processing",
+                "Try again in 30 seconds"
+            ],
+            K24ErrorCode.GEMINI_API_AUTH_FAILED: [
+                "AI service authentication error. Contact support.",
+                "Check API key configuration"
+            ],
+            K24ErrorCode.REDIS_CONNECTION_FAILED: [
+                "Cache service unavailable. System still working.",
+                "Performance might be slightly slower"
+            ],
+            
+            # --- VALIDATION ---
             K24ErrorCode.LEDGER_NOT_FOUND: [
-                "Check the party name spelling",
-                "Create the ledger in Tally first",
-                "Use exact name from Tally"
+                f"Ledger '{context.get('party_name', 'Unknown')}' not found in your Tally.",
+                "Did you mean one of these?",
+                "Select from suggestions or create new ledger?"
             ],
-            K24ErrorCode.AMOUNT_OUT_OF_RANGE: [
-                "Enter a valid positive amount",
-                f"Maximum allowed: ₹{context.get('max_limit', 1000000):,.2f}"
+            K24ErrorCode.INVALID_AMOUNT: [
+                f"Amount must be between ₹0 and ₹{context.get('max_limit', '1,00,00,000')}.",
+                "Edit amount and try again.",
+                f"You entered: {context.get('amount', 'Unknown')}"
             ],
+            K24ErrorCode.INVALID_DATE: [
+                "Date must be between [90 days ago] and [today].",
+                "Select valid date and try again.",
+                f"You entered: {context.get('date', 'Unknown')}"
+            ],
+            K24ErrorCode.INVALID_GST_RATE: [
+                "GST rate must be one of: 0%, 5%, 12%, 18%, 28%",
+                "For this item type, rate should likely be 18%",
+                "Use suggested rate?"
+            ],
+            K24ErrorCode.MALFORMED_REQUEST: [
+                "Your message format is unclear.",
+                "Try: 'Create invoice for ABC Corp ₹50,000 with 18% GST'",
+                "Rephrase and try again"
+            ],
+            K24ErrorCode.MESSAGE_TOO_LONG: [
+                "Message is too long (>2000 characters).",
+                "Break into shorter messages"
+            ],
+            K24ErrorCode.MESSAGE_TOO_SHORT: [
+                "Message too short. Please be more specific.",
+                "Add more details"
+            ],
+            
+            # --- FINANCIAL ---
+            K24ErrorCode.DUPLICATE_INVOICE_DETECTED: [
+                "This looks like a duplicate invoice.",
+                f"Similar exists: {context.get('duplicate_details', 'Check recent entries')}",
+                "Proceed anyway? [Yes/No]"
+            ],
+            K24ErrorCode.CREDIT_LIMIT_EXCEEDED: [
+                "Customer credit limit exceeded.",
+                f"Limit: ₹{context.get('credit_limit', 'Unknown')} | Outstanding: ₹{context.get('outstanding', 'Unknown')}",
+                "Request approval from Finance Manager"
+            ],
+            K24ErrorCode.REVERSE_CHARGE_APPLICABLE: [
+                "Reverse Charge applies to this purchase.",
+                "You must pay GST under RCM",
+                "Confirm to proceed with RCM"
+            ],
+            K24ErrorCode.TDS_OBLIGATION: [
+                "TDS deduction required.",
+                f"Deduct TDS under Section {context.get('tds_section', '194C')}",
+                "Automatic deduction, confirm? [Yes/No]"
+            ],
+            K24ErrorCode.GSTIN_MISMATCH: [
+                "GSTIN doesn't match the state code",
+                "Verify GSTIN and State",
+                "Update party master?"
+            ],
+            
+            # --- TALLY ---
+            K24ErrorCode.TALLY_COMPANY_NOT_OPEN: [
+                "No company is open in Tally",
+                "Please open a company in Tally Prime",
+                "Check Tally status"
+            ],
+            K24ErrorCode.TALLY_EDU_MODE_RESTRICTION: [
+                "Tally is in Educational Mode",
+                "Dates are restricted to 1st, 2nd, and 31st",
+                "Change date to 1st or 2nd?"
+            ]
         }
         
         return suggestions_map.get(error_code, ["Please try again or contact support"])

@@ -13,6 +13,12 @@
 - Tested error handling
 - **Status**: Core system functional
 
+### Step 2.5: India Compliance Layer ✅
+- Implemented 21+ India-specific validation rules (GST, TDS, MSME)
+- Added Tax Calculators (GST, TDS, RCM)
+- Integrated into `ValidatorAgent`
+- **Status**: Full Indian compliance validation active
+
 ### Step 3: API Integration ✅
 - Added `agent` router import to `backend/api.py`
 - Included agent router in FastAPI app

@@ -35,7 +35,7 @@ export const generateProfessionalVoucherPDF = (voucher: Voucher) => {
     doc.setFontSize(18);
     doc.setFont("helvetica", "bold");
     doc.setTextColor(darkGray[0], darkGray[1], darkGray[2]);
-    doc.text("SHREE JI SALES", 20, 25);
+    doc.text("Krishasales", 20, 25);
 
     // Company Details (Left)
     doc.setFontSize(9);
